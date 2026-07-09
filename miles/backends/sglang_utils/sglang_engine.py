@@ -216,11 +216,6 @@ class SGLangEngine(RayActor):
         _sanity_check_server_args(actual_server_args, expect_server_args)
 
     def _init_normal(self, server_args_dict):
-        import sglang
-        _sgl_dir = os.path.dirname(os.path.abspath(sglang.__file__))
-        _git_commit = os.popen(f"git -C {_sgl_dir} rev-parse HEAD 2>/dev/null").read().strip()
-        _git_branch = os.popen(f"git -C {_sgl_dir} rev-parse --abbrev-ref HEAD 2>/dev/null").read().strip()
-        logger.info(f"[SGLang git info] branch={_git_branch or 'unknown'} commit={_git_commit or 'unknown'}")
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 

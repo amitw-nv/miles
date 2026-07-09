@@ -760,10 +760,6 @@ def cmd_run(
     if not is_single_node:
         print(f"  Node rank  : {node_rank}, Head: {head_ip}")
     print("=" * 60)
-    _miles_dir = os.path.dirname(os.path.abspath(__file__))
-    _miles_commit = os.popen(f"git -C {_miles_dir} rev-parse HEAD 2>/dev/null").read().strip()
-    _miles_branch = os.popen(f"git -C {_miles_dir} rev-parse --abbrev-ref HEAD 2>/dev/null").read().strip()
-    print(f"  Miles git  : branch={_miles_branch or 'unknown'} commit={_miles_commit or 'unknown'}")
     print()
 
     # --- Cleanup stale processes (exclude self) ---
