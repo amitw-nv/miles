@@ -35,7 +35,7 @@ fi
 # --- Repos & branches -------------------------------------------------------
 MILES_REPO=git@github.com:amitw-nv/miles.git
 MILES_BRANCH=amitw/miles-nixl
-SGLANG_FORK=git@github.com:amitw-nv/sglang.git
+SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl
 
 # --- Paths ------------------------------------------------------------------
@@ -83,11 +83,12 @@ set -ex
 pip install -e /root/miles --no-deps -q
 
 # Checkout SGLang fork branch inside the container's built-in SGLang repo
-SGLANG_GIT=\$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)")
+SGLANG_PKG=\$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)")
+SGLANG_GIT=\$(git -C "\$SGLANG_PKG" rev-parse --show-toplevel)
 git -C "\$SGLANG_GIT" remote add fork $SGLANG_FORK 2>/dev/null || true
 git -C "\$SGLANG_GIT" fetch fork $SGLANG_BRANCH
 git -C "\$SGLANG_GIT" checkout $SGLANG_BRANCH
-pip install -e "\$SGLANG_GIT" --no-deps -q
+pip install -e "\$SGLANG_GIT/python" --no-deps -q
 
 # Apply known naming fix
 sed -i 's/model_loader_module\.post_load_weights/model_loader_module._post_load_weights/g' \
