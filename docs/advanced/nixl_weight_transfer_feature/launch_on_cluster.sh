@@ -1,12 +1,12 @@
 #!/bin/bash
 # Launch a Miles P2P weight transfer job on the HPC cluster.
-# Clones/updates Miles and SGLang from their forks to Lustre, then mounts
-# them into the container so you can run updated code without rebuilding the image.
+# - Miles: synced from fork to Lustre, mounted into container
+# - SGLang: uses the container's built-in repo; checks out the fork branch inside
 #
 # Usage: bash launch_on_cluster.sh <portfolio> <model> [mode]
 #   portfolio : network | trtllm | triton
 #   model     : GLM-Z1-9B-0414 | Qwen3-4B | GLM-4.7-Flash | ...
-#   mode      : p2p (default) | broadcast
+#   mode      : p2p (default) | broadcast | nixl
 
 set -e
 
@@ -35,13 +35,12 @@ fi
 # --- Repos & branches -------------------------------------------------------
 MILES_REPO=git@github.com:amitw-nv/miles.git
 MILES_BRANCH=amitw/miles-nixl
-SGLANG_REPO=git@github.com:amitw-nv/sglang.git
+SGLANG_FORK=git@github.com:amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl
 
 # --- Paths ------------------------------------------------------------------
 BASEDIR=/lustre/fsw/portfolios/network/users/$USER
 MILES_SRC=$BASEDIR/miles
-SGLANG_SRC=$BASEDIR/sglang
 LLM_MODELS=/lustre/fsw/portfolios/network/users/bbiber/llm_models
 
 C_IMAGE=docker://radixark/miles:latest
@@ -52,22 +51,20 @@ PARTITION=interactive
 TIME=02:00:00
 JOB_NAME=miles-p2p.$MODEL
 
-# --- Sync repos to Lustre ---------------------------------------------------
+# --- Sync Miles to Lustre ---------------------------------------------------
 sync_repo() {
     local repo=$1 branch=$2 dest=$3
     if [ -d "$dest/.git" ]; then
         echo "Updating $(basename $dest) ($branch)..."
         git -C "$dest" fetch origin
-        git -C "$dest" checkout "$branch"
-        git -C "$dest" pull origin "$branch"
+        git -C "$dest" reset --hard origin/"$branch"
     else
         echo "Cloning $(basename $dest) ($branch)..."
         git clone --branch "$branch" "$repo" "$dest"
     fi
 }
 
-sync_repo "$MILES_REPO"  "$MILES_BRANCH"  "$MILES_SRC"
-sync_repo "$SGLANG_REPO" "$SGLANG_BRANCH" "$SGLANG_SRC"
+sync_repo "$MILES_REPO" "$MILES_BRANCH" "$MILES_SRC"
 
 # --- Mounts -----------------------------------------------------------------
 SLURM_PATHS=/lib/x86_64-linux-gnu/libmunge.so.2,/run/munge,/etc/slurm,/cm/shared/apps/slurm/current:/opt/slurm
@@ -76,16 +73,26 @@ MOUNTS=$SLURM_PATHS
 MOUNTS+=,$BASEDIR:/workspace/lustre
 MOUNTS+=,$LLM_MODELS:/workspace/llm_models
 MOUNTS+=,$MILES_SRC:/root/miles
-MOUNTS+=,$SGLANG_SRC:/root/sglang
 MOUNTS+=,/lustre:/lustre
 
 # --- Command to run inside the container ------------------------------------
 INNER_CMD=$(cat <<EOF
 set -ex
+
+# Install Miles from mounted Lustre source
 pip install -e /root/miles --no-deps -q
-pip install -e /root/sglang/python --no-deps -q
+
+# Checkout SGLang fork branch inside the container's built-in SGLang repo
+SGLANG_GIT=\$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)")
+git -C "\$SGLANG_GIT" remote add fork $SGLANG_FORK 2>/dev/null || true
+git -C "\$SGLANG_GIT" fetch fork $SGLANG_BRANCH
+git -C "\$SGLANG_GIT" checkout $SGLANG_BRANCH
+pip install -e "\$SGLANG_GIT" --no-deps -q
+
+# Apply known naming fix
 sed -i 's/model_loader_module\.post_load_weights/model_loader_module._post_load_weights/g' \
   /root/miles/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py
+
 cd /root/miles
 python examples/p2p_weight_transfer/run.py run $MODEL --mode $MODE
 EOF
@@ -94,7 +101,7 @@ EOF
 # --- Launch -----------------------------------------------------------------
 echo "Launching: model=$MODEL mode=$MODE portfolio=$PORTFOLIO"
 echo "Miles src : $MILES_SRC ($MILES_BRANCH)"
-echo "SGLang src: $SGLANG_SRC ($SGLANG_BRANCH)"
+echo "SGLang    : container repo, branch $SGLANG_BRANCH from fork"
 echo ""
 
 srun \
