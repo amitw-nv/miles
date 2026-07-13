@@ -83,7 +83,7 @@ MOUNTS+=,/lustre:/lustre
 INNER_CMD=$(cat <<EOF
 set -ex
 pip install -e /root/miles --no-deps -q
-pip install -e /root/sglang --no-deps -q
+pip install -e /root/sglang/python --no-deps -q
 sed -i 's/model_loader_module\.post_load_weights/model_loader_module._post_load_weights/g' \
   /root/miles/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py
 cd /root/miles
