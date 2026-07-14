@@ -87,7 +87,7 @@ SGLANG_PKG=\$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__fil
 SGLANG_GIT=\$(git -C "\$SGLANG_PKG" rev-parse --show-toplevel)
 git -C "\$SGLANG_GIT" remote add fork $SGLANG_FORK 2>/dev/null || true
 git -C "\$SGLANG_GIT" fetch fork $SGLANG_BRANCH
-git -C "\$SGLANG_GIT" checkout $SGLANG_BRANCH
+git -C "\$SGLANG_GIT" checkout -B $SGLANG_BRANCH FETCH_HEAD
 pip install -e "\$SGLANG_GIT/python" --no-deps -q
 
 # Apply known naming fix
