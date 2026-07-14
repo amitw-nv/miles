@@ -45,7 +45,7 @@ LLM_MODELS=/lustre/fsw/portfolios/network/users/bbiber/llm_models
 
 C_IMAGE=docker://radixark/miles:latest
 C_SAVED=$BASEDIR/miles/radixark+miles+latest.sqsh
-C_NAME=miles-dev-$USER
+C_NAME=amitw-miles-nohome
 
 PARTITION=interactive
 TIME=02:00:00
@@ -71,7 +71,7 @@ SLURM_PATHS=/lib/x86_64-linux-gnu/libmunge.so.2,/run/munge,/etc/slurm,/cm/shared
 
 MOUNTS=$SLURM_PATHS
 MOUNTS+=,$BASEDIR:/workspace/lustre
-MOUNTS+=,$LLM_MODELS:/root/models
+MOUNTS+=,$LLM_MODELS:/workspace/llm_models
 MOUNTS+=,$MILES_SRC:/root/miles
 MOUNTS+=,/lustre:/lustre
 
