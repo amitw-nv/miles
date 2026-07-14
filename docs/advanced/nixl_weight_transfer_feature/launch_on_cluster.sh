@@ -95,6 +95,10 @@ sed -i 's/model_loader_module\.post_load_weights/model_loader_module._post_load_
   /root/miles/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py
 
 cd /root/miles
+# Prepare model if not already done (downloads + converts checkpoint)
+if [ ! -d /root/multinode/${MODEL}_torch_dist ]; then
+    python examples/p2p_weight_transfer/run.py prepare $MODEL
+fi
 python examples/p2p_weight_transfer/run.py run $MODEL --mode $MODE
 EOF
 )
