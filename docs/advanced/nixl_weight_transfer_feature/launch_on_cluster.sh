@@ -79,9 +79,6 @@ MOUNTS+=,/lustre:/lustre
 INNER_CMD=$(cat <<EOF
 set -ex
 
-# Install Miles from mounted Lustre source
-pip install -e /root/miles --no-deps -q
-
 # Checkout SGLang fork branch inside the container's built-in SGLang repo
 SGLANG_PKG=\$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)")
 SGLANG_GIT=\$(git -C "\$SGLANG_PKG" rev-parse --show-toplevel)
@@ -90,15 +87,17 @@ git -C "\$SGLANG_GIT" fetch fork $SGLANG_BRANCH
 git -C "\$SGLANG_GIT" checkout -B $SGLANG_BRANCH FETCH_HEAD
 pip install -e "\$SGLANG_GIT/python" --no-deps -q
 
-# Apply known naming fix
-sed -i 's/model_loader_module\.post_load_weights/model_loader_module._post_load_weights/g' \
-  /root/miles/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py
-
 cd /root/miles
-# Prepare model if not already done (downloads + converts checkpoint)
+# Prepare using container's pre-installed Miles (fresh install breaks conversion)
 if [ ! -d /root/multinode/${MODEL}_torch_dist ]; then
     python examples/p2p_weight_transfer/run.py prepare $MODEL
 fi
+
+# Install latest Miles and apply fixes for the training run
+pip install -e /root/miles --no-deps -q
+sed -i 's/model_loader_module\.post_load_weights/model_loader_module._post_load_weights/g' \
+  /root/miles/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py
+
 python examples/p2p_weight_transfer/run.py run $MODEL --mode $MODE
 EOF
 )
