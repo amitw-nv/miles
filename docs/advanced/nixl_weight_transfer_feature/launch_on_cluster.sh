@@ -43,8 +43,8 @@ BASEDIR=/lustre/fsw/portfolios/network/users/$USER
 MILES_SRC=$BASEDIR/miles
 LLM_MODELS=/lustre/fsw/portfolios/network/users/bbiber/llm_models
 
-C_IMAGE=docker://radixark/miles:latest
 C_SAVED=$BASEDIR/miles/radixark+miles+latest.sqsh
+C_IMAGE=$C_SAVED
 C_NAME=amitw-miles-nohome
 
 PARTITION=interactive
