@@ -7,6 +7,10 @@
 #   portfolio : network | trtllm | triton
 #   model     : GLM-Z1-9B-0414 | Qwen3-4B | GLM-4.7-Flash | ...
 #   mode      : p2p (default) | broadcast | nixl
+#
+# To reset a corrupted container:
+#   rm -f /lustre/fsw/portfolios/network/users/$USER/miles/radixark+miles+latest.sqsh
+#   The next run starts fresh from the Docker base image.
 
 set -e
 
@@ -41,10 +45,17 @@ SGLANG_BRANCH=amitw/sgl-miles-nixl
 # --- Paths ------------------------------------------------------------------
 BASEDIR=/lustre/fsw/portfolios/network/users/$USER
 MILES_SRC=$BASEDIR/miles
-LLM_MODELS=/lustre/fsw/portfolios/network/users/bbiber/llm_models
+LLM_MODELS=/lustre/fsw/portfolios/network/users/amitw/models
 
+# Container: use saved sqsh when it exists; fall back to Docker base so the
+# sqsh can be deleted to force a clean rebuild.
+C_BASE=radixark/miles:latest
 C_SAVED=$BASEDIR/miles/radixark+miles+latest.sqsh
-C_IMAGE=$C_SAVED
+if [ -f "$C_SAVED" ]; then
+    C_IMAGE=$C_SAVED
+else
+    C_IMAGE=$C_BASE
+fi
 C_NAME=amitw-miles-nohome
 
 PARTITION=interactive
@@ -71,13 +82,19 @@ SLURM_PATHS=/lib/x86_64-linux-gnu/libmunge.so.2,/run/munge,/etc/slurm,/cm/shared
 
 MOUNTS=$SLURM_PATHS
 MOUNTS+=,$BASEDIR:/workspace/lustre
-MOUNTS+=,$LLM_MODELS:/workspace/llm_models
+MOUNTS+=,$LLM_MODELS:/root/models
 MOUNTS+=,$MILES_SRC:/root/miles
 MOUNTS+=,/lustre:/lustre
 
 # --- Command to run inside the container ------------------------------------
 INNER_CMD=$(cat <<EOF
 set -ex
+
+# Apply naming fix before any Miles code runs; the container has miles as an
+# editable install pointing to /root/miles, so the mounted branch code is
+# active immediately.
+sed -i 's/model_loader_module\.post_load_weights/model_loader_module._post_load_weights/g' \
+  /root/miles/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py
 
 # Checkout SGLang fork branch inside the container's built-in SGLang repo
 SGLANG_PKG=\$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)")
@@ -88,24 +105,22 @@ git -C "\$SGLANG_GIT" checkout -B $SGLANG_BRANCH FETCH_HEAD
 pip install -e "\$SGLANG_GIT/python" --no-deps -q
 
 cd /root/miles
-# Prepare using container's pre-installed Miles (fresh install breaks conversion)
-if [ ! -d /root/multinode/${MODEL}_torch_dist ]; then
+
+# Prepare: check tracker file so a partial conversion does not get skipped
+CKPT_TRACKER=/root/multinode/${MODEL}_torch_dist/latest_checkpointed_iteration.txt
+if [ "\$(cat "\$CKPT_TRACKER" 2>/dev/null)" != "release" ]; then
     python examples/p2p_weight_transfer/run.py prepare $MODEL
 fi
-
-# Install latest Miles and apply fixes for the training run
-pip install -e /root/miles --no-deps -q
-sed -i 's/model_loader_module\.post_load_weights/model_loader_module._post_load_weights/g' \
-  /root/miles/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py
 
 python examples/p2p_weight_transfer/run.py run $MODEL --mode $MODE
 EOF
 )
 
 # --- Launch -----------------------------------------------------------------
-echo "Launching: model=$MODEL mode=$MODE portfolio=$PORTFOLIO"
+echo "Launching : model=$MODEL  mode=$MODE  portfolio=$PORTFOLIO"
 echo "Miles src : $MILES_SRC ($MILES_BRANCH)"
 echo "SGLang    : container repo, branch $SGLANG_BRANCH from fork"
+echo "Container : $C_IMAGE  ->  saved to $C_SAVED"
 echo ""
 
 srun \
