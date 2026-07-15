@@ -1,138 +1,163 @@
 #!/bin/bash
-# Launch a Miles P2P weight transfer job on the HPC cluster.
-# - Miles: synced from fork to Lustre, mounted into container
-# - SGLang: uses the container's built-in repo; checks out the fork branch inside
+# =============================================================================
+# launch_on_cluster.sh — Run a Miles P2P weight transfer job on the cluster
+# =============================================================================
 #
-# Usage: bash launch_on_cluster.sh <portfolio> <model> [mode]
-#   portfolio : network | trtllm | triton
-#   model     : GLM-Z1-9B-0414 | Qwen3-4B | GLM-4.7-Flash | ...
-#   mode      : p2p (default) | broadcast | nixl
+# PREREQUISITES
+# -------------
+# The sqsh file must exist at:
+#   /lustre/fsw/portfolios/network/users/amitw/miles/radixark+miles+latest.sqsh
 #
-# To reset a corrupted container:
-#   rm -f /lustre/fsw/portfolios/network/users/$USER/miles/radixark+miles+latest.sqsh
-#   The next run starts fresh from the Docker base image.
+# If it doesn't exist, create it from a compute node (login node has no space):
+#   srun -A network_research_advdev -N 1 --gpus-per-node=8 -p interactive --time=01:00:00 --pty /bin/bash
+#   cd /lustre/fsw/portfolios/network/users/amitw/miles/
+#   enroot import docker://radixark/miles:latest
+#
+# HOW THIS SCRIPT WORKS
+# ---------------------
+# 1. Runs srun to allocate a compute node and start the container from the sqsh.
+#    - The sqsh is built from radixark/miles:latest (Docker Hub) and contains
+#      the base Miles + SGLang environment.
+#    - No --container-mounts: mounting causes Megatron import issues, and the
+#      sqsh already has Miles + SGLang installed inside.
+#    - --container-name persists the container across sessions on the same node.
+#      The sqsh is only used on first run; subsequent runs reuse the saved state.
+#
+# 2. Inside the container, updates Miles and SGLang to your fork branches:
+#    - Miles:  github.com/amitw-nv/miles  branch amitw/miles-nixl
+#    - SGLang: github.com/amitw-nv/sglang branch amitw/sgl-miles-nixl
+#    Both are installed as editable (pip install -e .), so git checkout alone
+#    is enough to activate code changes — no reinstall needed.
+#
+# 3. Fixes package version mismatches caused by the sqsh base image:
+#    - The sqsh's sglang base ships numpy 2.x, but Megatron requires numpy 1.x.
+#    - Downgrading numpy requires also downgrading scipy (scipy>=1.15 needs numpy>=2).
+#    These are installed once and persist in the named container.
+#
+# 4. Drops you into an interactive shell inside the container, ready to run
+#    whatever model or command you need.
+#
+# USAGE
+# -----
+#   bash launch_on_cluster.sh
+#
+# RESETTING THE CONTAINER
+# -----------------------
+# The named container (amitw-miles-nohome) persists on each node. If it gets
+# into a broken state, delete the sqsh to force a clean rebuild on next run:
+#   rm -f /lustre/fsw/portfolios/network/users/amitw/miles/radixark+miles+latest.sqsh
+#   enroot import docker://radixark/miles:latest  # recreate it first
+# =============================================================================
 
 set -e
 
-# --- Args -------------------------------------------------------------------
-PORTFOLIO_ARG="${1:-}"
-MODEL="${2:-}"
-MODE="${3:-p2p}"
+# --- Config ------------------------------------------------------------------
+PORTFOLIO=network_research_advdev
 
-case "$PORTFOLIO_ARG" in
-    network) PORTFOLIO=network_research_advdev ;;
-    trtllm)  PORTFOLIO=coreai_comparch_trtllm ;;
-    triton)  PORTFOLIO=coreai_tritoninference_triton3 ;;
-    *)
-        echo "Error: first arg must be 'network', 'trtllm', or 'triton'"
-        echo "Usage: bash launch_on_cluster.sh <portfolio> <model> [mode]"
-        exit 1
-        ;;
-esac
-
-if [ -z "$MODEL" ]; then
-    echo "Error: model name required (e.g. GLM-Z1-9B-0414, Qwen3-4B, GLM-4.7-Flash)"
-    echo "Usage: bash launch_on_cluster.sh <portfolio> <model> [mode]"
-    exit 1
-fi
-
-# --- Repos & branches -------------------------------------------------------
-MILES_REPO=git@github.com:amitw-nv/miles.git
+MILES_FORK=https://github.com/amitw-nv/miles.git
 MILES_BRANCH=amitw/miles-nixl
+
 SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl
 
-# --- Paths ------------------------------------------------------------------
-BASEDIR=/lustre/fsw/portfolios/network/users/$USER
-MILES_SRC=$BASEDIR/miles
-LLM_MODELS=/lustre/fsw/portfolios/network/users/amitw/models
-
-# Container: use saved sqsh when it exists; fall back to Docker base so the
-# sqsh can be deleted to force a clean rebuild.
-C_BASE=radixark/miles:latest
-C_SAVED=$BASEDIR/miles/radixark+miles+latest.sqsh
-if [ -f "$C_SAVED" ]; then
-    C_IMAGE=$C_SAVED
-else
-    C_IMAGE=$C_BASE
-fi
+SQSH=/lustre/fsw/portfolios/network/users/amitw/miles/radixark+miles+latest.sqsh
 C_NAME=amitw-miles-nohome
 
-PARTITION=interactive
-TIME=02:00:00
-JOB_NAME=miles-p2p.$MODEL
+# --- Validate sqsh exists ----------------------------------------------------
+if [ ! -f "$SQSH" ]; then
+    echo ""
+    echo "ERROR: sqsh file not found at $SQSH"
+    echo ""
+    echo "To create it, run on a compute node (login node has no disk space):"
+    echo "  srun -A network_research_advdev -N 1 --gpus-per-node=8 -p interactive --time=01:00:00 --pty /bin/bash"
+    echo "  cd /lustre/fsw/portfolios/network/users/amitw/miles/"
+    echo "  enroot import docker://radixark/miles:latest"
+    echo ""
+    exit 1
+fi
 
-# --- Sync Miles to Lustre ---------------------------------------------------
-sync_repo() {
-    local repo=$1 branch=$2 dest=$3
-    if [ -d "$dest/.git" ]; then
-        echo "Updating $(basename $dest) ($branch)..."
-        git -C "$dest" fetch origin
-        git -C "$dest" reset --hard origin/"$branch"
-    else
-        echo "Cloning $(basename $dest) ($branch)..."
-        git clone --branch "$branch" "$repo" "$dest"
-    fi
-}
+# --- Print launch info -------------------------------------------------------
+echo ""
+echo "=========================================="
+echo "  Miles cluster launch"
+echo "=========================================="
+echo "  Portfolio : $PORTFOLIO"
+echo "  Miles     : $MILES_BRANCH"
+echo "  SGLang    : $SGLANG_BRANCH"
+echo "  Container : $C_NAME (from $SQSH)"
+echo "=========================================="
+echo ""
 
-sync_repo "$MILES_REPO" "$MILES_BRANCH" "$MILES_SRC"
-
-# --- Mounts -----------------------------------------------------------------
-SLURM_PATHS=/lib/x86_64-linux-gnu/libmunge.so.2,/run/munge,/etc/slurm,/cm/shared/apps/slurm/current:/opt/slurm
-
-MOUNTS=$SLURM_PATHS
-MOUNTS+=,$BASEDIR:/workspace/lustre
-MOUNTS+=,$LLM_MODELS:/root/models
-MOUNTS+=,$MILES_SRC:/root/miles
-MOUNTS+=,/lustre:/lustre
-
-# --- Command to run inside the container ------------------------------------
+# --- Command to run inside the container -------------------------------------
+#
+# This runs after the container starts. Steps:
+#  1. Update Miles from fork (discard any local edits first to avoid merge conflicts)
+#  2. Update SGLang from fork (same)
+#  3. Fix numpy/scipy versions (Megatron needs numpy<2; sqsh ships numpy 2.x)
+#  4. Print the active commits so you can verify the right code is running
+#  5. Drop into interactive shell
+#
 INNER_CMD=$(cat <<EOF
 set -ex
 
-# Apply naming fix before any Miles code runs; the container has miles as an
-# editable install pointing to /root/miles, so the mounted branch code is
-# active immediately.
-sed -i 's/model_loader_module\.post_load_weights/model_loader_module._post_load_weights/g' \
-  /root/miles/miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py
+# ---- Step 1: Update Miles ---------------------------------------------------
+# The sqsh has Miles cloned at /root/miles from the main branch at build time.
+# We switch it to our fork branch. Steps:
+#  - Add the fork remote (safe to re-run, || true ignores "already exists")
+#  - Discard any local edits (e.g. sed patches from a previous session) so
+#    checkout doesn't abort with "local changes would be overwritten"
+#  - Fetch the branch from the fork and check it out
+echo "--- Updating Miles ($MILES_BRANCH) ---"
+git -C /root/miles remote add fork $MILES_FORK 2>/dev/null || true
+git -C /root/miles restore . 2>/dev/null || git -C /root/miles checkout . 2>/dev/null || true
+git -C /root/miles fetch fork $MILES_BRANCH
+git -C /root/miles checkout -B $MILES_BRANCH fork/$MILES_BRANCH
 
-# Checkout SGLang fork branch inside the container's built-in SGLang repo
-SGLANG_PKG=\$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)")
-SGLANG_GIT=\$(git -C "\$SGLANG_PKG" rev-parse --show-toplevel)
-git -C "\$SGLANG_GIT" remote add fork $SGLANG_FORK 2>/dev/null || true
-git -C "\$SGLANG_GIT" fetch fork $SGLANG_BRANCH
-git -C "\$SGLANG_GIT" checkout -B $SGLANG_BRANCH FETCH_HEAD
-pip install -e "\$SGLANG_GIT/python" --no-deps -q
+# ---- Step 2: Update SGLang --------------------------------------------------
+# SGLang lives at /sgl-workspace/sglang (not mounted, baked into the sqsh).
+# Same approach: add fork remote, discard local changes, fetch and checkout.
+echo "--- Updating SGLang ($SGLANG_BRANCH) ---"
+git -C /sgl-workspace/sglang remote add fork $SGLANG_FORK 2>/dev/null || true
+git -C /sgl-workspace/sglang restore . 2>/dev/null || git -C /sgl-workspace/sglang checkout . 2>/dev/null || true
+git -C /sgl-workspace/sglang fetch fork $SGLANG_BRANCH
+git -C /sgl-workspace/sglang checkout -B $SGLANG_BRANCH fork/$SGLANG_BRANCH
 
+# ---- Step 3: Fix numpy and scipy versions -----------------------------------
+# The sqsh base image (lmsysorg/sglang:v0.5.13) ships numpy 2.x and scipy 1.18.
+# Megatron asserts numpy<2 at startup. Downgrading numpy also requires
+# downgrading scipy because scipy>=1.15 requires numpy>=2.
+# pip install is idempotent — safe to re-run on subsequent sessions.
+echo "--- Fixing numpy and scipy versions ---"
+pip install -q "numpy<2" "scipy<1.15"
+
+# ---- Step 4: Print active commits -------------------------------------------
+echo ""
+echo "--- Active code ---"
+echo "Miles  : \$(git -C /root/miles log --oneline -1)"
+echo "SGLang : \$(git -C /sgl-workspace/sglang log --oneline -1)"
+echo "numpy  : \$(python -c 'import numpy; print(numpy.__version__)')"
+echo ""
+
+# ---- Step 5: Ready — drop into interactive shell ----------------------------
+# Environment is set up. Run your model manually, e.g.:
+#   bash examples/p2p_weight_transfer/GLM-Z1-9B.sh p2p
+#   bash examples/p2p_weight_transfer/GLM-Z1-9B.sh broadcast
+echo "--- Setup complete. You are now inside the container. ---"
+echo "--- Run your model, e.g.: bash examples/p2p_weight_transfer/GLM-Z1-9B.sh p2p ---"
 cd /root/miles
-
-# Prepare: check tracker file so a partial conversion does not get skipped
-CKPT_TRACKER=/root/multinode/${MODEL}_torch_dist/latest_checkpointed_iteration.txt
-if [ "\$(cat "\$CKPT_TRACKER" 2>/dev/null)" != "release" ]; then
-    python examples/p2p_weight_transfer/run.py prepare $MODEL
-fi
-
-python examples/p2p_weight_transfer/run.py run $MODEL --mode $MODE
+exec /bin/bash
 EOF
 )
 
-# --- Launch -----------------------------------------------------------------
-echo "Launching : model=$MODEL  mode=$MODE  portfolio=$PORTFOLIO"
-echo "Miles src : $MILES_SRC ($MILES_BRANCH)"
-echo "SGLang    : container repo, branch $SGLANG_BRANCH from fork"
-echo "Container : $C_IMAGE  ->  saved to $C_SAVED"
-echo ""
-
+# --- Launch ------------------------------------------------------------------
 srun \
     -A "$PORTFOLIO" \
     -N 1 \
     --gpus-per-node=8 \
-    -p "$PARTITION" \
-    --time="$TIME" \
-    -J "$JOB_NAME" \
-    --container-image="$C_IMAGE" \
-    --container-save="$C_SAVED" \
-    --container-name="$C_NAME" \
+    -p interactive \
+    --time=02:00:00 \
+    -J "miles-setup" \
+    --container-image="$SQSH" \
     --no-container-mount-home \
-    --container-mounts="$MOUNTS" \
-    bash -c "$INNER_CMD"
+    --container-name="$C_NAME" \
+    --pty bash -c "$INNER_CMD"
