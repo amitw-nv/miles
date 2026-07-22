@@ -27,6 +27,30 @@ update loop are all reused; we add a `nixl` branch at each decision point.
 
 The NIXL seed flag is an internal contract between Miles and SGLang; the user only sets `--mode nixl`.
 
+### Backend branch map
+
+The NIXL backend stays inside `UpdateWeightP2P`; only five points branch, while planning, conversion,
+staging, scheduling, completion, and engine lifecycle remain shared:
+
+```text
+run.py  (--mode nixl → --update-weight-transfer-backend nixl)  ── BRANCH 0 (launch flags)
+  │
+  └─ UpdateWeightP2P                                   [SHARED class, mode == p2p]
+       connect_rollout_engines
+         plan_p2p()                                    [SHARED]
+         query_remote_weight_infos()                   ── BRANCH 1 (metadata / handshake)
+         create_transfer_engine / create_nixl_agent    ── BRANCH 2 (engine vs agent)
+         _create_cpu_replica() + conversion + meta_list [SHARED]
+       _pause_and_prepare_engines
+         register_cpu_memory[_nixl]()                  ── BRANCH 3 (one-time registration)
+       _update_weight_implementation
+         staging + load_weights + scheduling           [SHARED]
+         _do_p2p_write_one_session
+           batch_transfer_sync_write / NIXL xfer seq   ── BRANCH 4 (the write)
+       _gather_and_update_expert_weights → wait_transfers()   [SHARED]
+       _finalize_and_resume_engines (post_load_weights=True)  [SHARED]
+```
+
 ## 2. Assumptions
 
 These are the assumptions this design is built on. If any is wrong the corresponding section changes.
@@ -82,21 +106,26 @@ new agent object and a new write sequence but fits entirely within this existing
 
 ### 3.1 Block-by-block: each Mooncake API and the NIXL parallel Miles must provide
 
-| # | Pipeline block | Mooncake API (exists) | NIXL parallel (to add) | Who owns it |
+| # | Pipeline block | Mooncake path | NIXL path | Who owns it |
 |---|---|---|---|---|
-| 1 | Agent / engine object | `TransferEngine` handle from SGLang `session_id` | `nixl.Agent()` constructed locally by Miles | Miles rank |
-| 2 | Peer connection | `session_id` host:port string, implicit P2PHANDSHAKE | `add_remote_agent(decoded_agent_metadata)` called once per target at init (not per iteration); results stored as `agent_name → weights_info_dict` map | Miles rank |
-| 3 | Source memory reg | CPU tensors referenced by pointer only | `agent.register_memory([(addr, size, 0, "")], "DRAM")` with pinned tensors | Miles rank |
-| 4 | Per-tensor source descriptors | `(addr, numel, element_size)` 3-tuple | `(addr, size, 0)` 3-tuple for `get_xfer_descs` | Miles rank |
-| 5 | Per-tensor dest descriptors | remote `(addr, numel, element_size)` from `RemoteWeightInfo` | `(addr, size, device_id)` 3-tuple from extended `RemoteWeightInfo` | Miles rank |
-| 6 | Transfer call | `transfer_engine.transfer(session_id, local, remote, lens)` | `get_xfer_descs` → `initialize_xfer("WRITE", …)` → `transfer()` → poll `check_xfer_state()` | Miles rank |
-| 7 | Metadata discovery | `GET /remote_instance_transfer_engine_info` → `{session_id, weights_info_dict}` | same URL → `{backend, agent_name, agent_metadata(b64), weights_info_dict}` with 4-field entries | Miles (consumer) |
+| B0 | Launch selection | `--mode mooncake` selects the default backend | `--mode nixl` emits the Miles backend flag and SGLang NIXL seed flag | `run.py` |
+| S1 | Transfer planning | `plan_p2p()` maps each source rank to target `(engine_ind, engine_rank)` pairs | Same; backend-independent | Miles rank |
+| B1 | Metadata discovery / peer handshake | Query the endpoint for `{session_id, weights_info_dict}`; the `session_id` drives implicit `P2PHANDSHAKE` | Query the same endpoint for `{backend, agent_name, agent_metadata, weights_info_dict}`; call `add_remote_agent(decoded_agent_metadata)` once per target | Miles rank |
+| B2 | Local transfer object | Construct one Mooncake `TransferEngine` for all targets | Construct one local `nixl.Agent()` for all targets | Miles rank |
+| S2 | CPU replica, conversion, and target grouping | `_create_cpu_replica()` creates shared pinned buffers; conversion and `_transfer_engine_meta_list` group work by target rank | Same; only the remote identity in each metadata entry differs | Miles rank |
+| B3 | Source memory registration | `register_cpu_memory()` registers the shared pinned buffers with the transfer engine | `register_cpu_memory_nixl()` registers `(addr, size, 0, "")` DRAM regions with the agent | Miles rank, once on first prepare |
+| S3 | Staging and scheduling | Stage shards, call `load_weights()`, synchronously protect reusable replicas, and submit the final replica's writes in the background | Same | Miles rank |
+| B4a | Per-tensor source descriptors | Registered `(addr, numel, element_size)` tuple | `(addr, size, 0)` tuple passed to `get_xfer_descs` | Miles rank |
+| B4b | Per-tensor destination descriptors | Remote `(addr, numel, element_size)` from `RemoteWeightInfo` | Remote `(addr, size, device_id)` derived from the four-field weight metadata | Miles rank |
+| B4c | Transfer call | `batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)` | `get_xfer_descs` → `initialize_xfer("WRITE", …)` → `transfer()` → poll `check_xfer_state()` | Miles rank |
+| S4 | Completion barrier | `_gather_and_update_expert_weights()` calls `wait_transfers()` | Same | Miles rank |
+| S5 | Engine finalization | Update the weight version and resume with `post_load_weights=True` | Same | Miles / SGLang lifecycle |
 
-**Reading the map.** All stages run inside Miles. SGLang is a pure data source: it registers GPU
-memory and serves metadata, but no SGLang code executes during the transfer. The crux of the
-difference is stage 2: Mooncake uses an implicit `P2PHANDSHAKE`; NIXL requires an explicit
-`add_remote_agent` call before any transfer can proceed (assumption **A6**). Everything else is a
-1:1 substitution of the API call within an already-existing block.
+**Reading the map.** `B0`–`B4` correspond to the five branch points above; `S1`–`S5` make the shared
+blocks explicit. All stages run inside Miles. SGLang registers GPU memory, serves metadata, and runs
+the existing post-load lifecycle hook, but it does not issue transfer operations. The crux of the
+difference is `B1`: Mooncake uses an implicit `P2PHANDSHAKE`; NIXL requires an explicit
+`add_remote_agent` call before any transfer can proceed (assumption **A6**).
 
 ## 4. Minimal delta for NIXL
 
@@ -128,17 +157,16 @@ Per touch point, the smallest change that makes NIXL work. Nothing is duplicated
 
 ### 4.4 CPU DRAM registration (branch in one helper)
 
-- Add `register_cpu_memory_nixl(nixl_agent, tensors)` and `deregister_cpu_memory_nixl(nixl_agent,
-  handles)` in `p2p_transfer_utils.py`.
+- Add `register_cpu_memory_nixl(nixl_agent, tensors)` in `p2p_transfer_utils.py`.
 - Tensors must be pinned; `device_id = 0` for all DRAM regions.
-- Registration happens after format conversion, before `get_xfer_descs`; deregistration is in a
-  `finally` block to avoid leaks on error.
+- `_pause_and_prepare_engines()` registers the shared CPU buffers on its first call, mirroring
+  Mooncake's one-time registration. The buffers and registration remain valid for subsequent
+  weight-update iterations.
 
 ### 4.5 NIXL WRITE transfer loop (branch in the write path)
 
-- Add `_transfer_weights_nixl()` in `p2p.py` — the NIXL 3-step sequence per parameter.
-- Branch the existing write loop: if `backend == "nixl"`, call `_transfer_weights_nixl()`; otherwise
-  keep the existing Mooncake call.
+- Branch `_do_p2p_write_one_session()`: if `backend == "nixl"`, run the NIXL transfer sequence per
+  parameter; otherwise keep the existing Mooncake `batch_transfer_sync_write()` call.
 - No Mooncake code is modified; the two paths are fully independent.
 
 ## 5. The metadata schema Miles consumes

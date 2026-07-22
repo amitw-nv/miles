@@ -14,8 +14,7 @@ expected results live here.
   - *static* — source inspection; no import side effects.
   - *unit* — imports a module or patches at import time; no GPU or model.
   - *e2e* — launches real processes; needs GPU (+ model + NIXL/UCX for the NIXL path).
-- A one-shot runner for the no-GPU tests of steps 1–4 lives at `run_tests_steps_1_4.sh`
-  (created separately).
+- The commands below are the source of truth; no aggregate runner is assumed.
 
 ### Prerequisite gate (run before any NIXL e2e test)
 
@@ -23,8 +22,8 @@ expected results live here.
 python -c "import nixl; print('nixl importable')"
 ```
 
-Not a feature test — it is a gate. If it fails, all NIXL e2e tests (3c, 4b, 4c, 5e) will run
-vacuously or error on import; confirm this prints `nixl importable` before trusting them.
+Not a feature test — it is a gate. If it fails, the NIXL-dependent tests (3a, 3c, 4c, and 5e)
+will error on import or cannot run; confirm this prints `nixl importable` before trusting them.
 
 ---
 
@@ -69,7 +68,7 @@ python examples/p2p_weight_transfer/run.py run --help | grep -A2 -- --mode
 ```bash
 python -c "
 import inspect
-from miles.engine import sglang_engine
+from miles.backends.sglang_utils import sglang_engine
 src = inspect.getsource(sglang_engine)
 assert '/remote_instance_transfer_engine_info' in src
 assert '/get_remote_instance_transfer_engine_info' not in src, 'stale URL still present'
@@ -88,11 +87,13 @@ print('OK: endpoint URL correct')
 
 ```bash
 python -c "
-from unittest.mock import patch
-import requests
-from miles.p2p.p2p_transfer_utils import query_remote_weight_infos
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    query_remote_weight_infos,
+)
 
-fake = {
+response = {
     'backend': 'nixl',
     'agent_name': 'sglang_worker_0',
     'agent_metadata': 'dGVzdA==',
@@ -100,43 +101,57 @@ fake = {
         'model.embed_tokens.weight': [140000000000, 131072, 2, 0]
     },
 }
-with patch.object(requests, 'get') as m:
-    m.return_value.json.return_value = fake
-    backend, infos = query_remote_weight_infos('http://fake/remote_instance_transfer_engine_info')
+engine = MagicMock()
+target = SimpleNamespace(engine_ind=0, engine_rank=0)
 
-assert backend == 'nixl', backend
-info = infos['model.embed_tokens.weight']
-assert info.agent_name == 'sglang_worker_0'
-assert info.device_id == 0
-assert info.backend == 'nixl'
+# query result, parallelism info, then server info
+with patch(
+    'miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils.ray.get',
+    side_effect=[response, {'tp_rank': 0}, {}],
+):
+    remote_by_id, target_to_id, _ = query_remote_weight_infos([engine], [target])
+
+remote_id = target_to_id[(0, 0)]
+assert remote_id == 'sglang_worker_0'
+weights_info = remote_by_id[remote_id][0]
+assert weights_info['model.embed_tokens.weight'] == (140000000000, 131072, 2, 0)
 print('OK: NIXL dict format parsed')
 "
 ```
 
-- **Checks:** the NIXL 4-field dict format is parsed; `agent_name` and `backend` are populated on `RemoteWeightInfo`.
+- **Checks:** the existing Ray-actor query contract accepts the NIXL response, uses `agent_name` as
+  the remote identity, and preserves the four-field destination metadata.
 - **Expected:** prints `OK: NIXL dict format parsed`.
 
 ### Test 2b — `query_remote_weight_infos()` still parses Mooncake tuple format (unit, no GPU)
 
 ```bash
 python -c "
-from unittest.mock import patch
-import requests
-from miles.p2p.p2p_transfer_utils import query_remote_weight_infos
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    query_remote_weight_infos,
+)
 
-fake = {
+response = {
     'backend': 'mooncake',
     'session_id': '10.0.0.7:18000',
     'weights_info_dict': {
-        'model.embed_tokens.weight': [140000000000, 131072, 2, 0]
+        'model.embed_tokens.weight': [140000000000, 131072, 2]
     },
 }
-with patch.object(requests, 'get') as m:
-    m.return_value.json.return_value = fake
-    backend, infos = query_remote_weight_infos('http://fake/remote_instance_transfer_engine_info')
+engine = MagicMock()
+target = SimpleNamespace(engine_ind=0, engine_rank=0)
 
-assert backend == 'mooncake', backend
-assert infos['model.embed_tokens.weight'].backend == 'mooncake'
+with patch(
+    'miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils.ray.get',
+    side_effect=[response, {'tp_rank': 0}, {}],
+):
+    remote_by_id, target_to_id, _ = query_remote_weight_infos([engine], [target])
+
+session_id = target_to_id[(0, 0)]
+assert session_id == '10.0.0.7:18000'
+assert remote_by_id[session_id][0]['model.embed_tokens.weight'] == (140000000000, 131072, 2)
 print('OK: Mooncake format still parsed')
 "
 ```
@@ -148,8 +163,10 @@ print('OK: Mooncake format still parsed')
 
 ```bash
 python -c "
-from miles.p2p.p2p_transfer_utils import RemoteWeightInfo
 import dataclasses
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    RemoteWeightInfo,
+)
 fields = {f.name: f for f in dataclasses.fields(RemoteWeightInfo)}
 assert 'agent_name' in fields and fields['agent_name'].default == ''
 assert 'backend' in fields and fields['backend'].default == 'mooncake'
@@ -169,7 +186,9 @@ print('OK: RemoteWeightInfo has new fields')
 ```bash
 python -c "import nixl; print('nixl importable')"   # gate first
 python -c "
-from miles.p2p.p2p_transfer_utils import create_nixl_agent
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    create_nixl_agent,
+)
 agent = create_nixl_agent()
 assert agent is not None
 print('OK: create_nixl_agent returns agent')
@@ -179,22 +198,25 @@ print('OK: create_nixl_agent returns agent')
 - **Checks:** the helper exists and constructs a NIXL agent without error.
 - **Expected:** prints `OK: create_nixl_agent returns agent`.
 
-### Test 3b — p2p init branches on backend (static, no GPU)
+### Test 3b — `connect_rollout_engines()` branches on backend (static, no GPU)
 
 ```bash
 python -c "
 import inspect
-from miles.p2p import p2p
-src = inspect.getsource(p2p)
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p import (
+    UpdateWeightP2P,
+)
+src = inspect.getsource(UpdateWeightP2P.connect_rollout_engines)
 assert 'create_nixl_agent' in src
 assert 'add_nixl_remote_agent' in src
-assert 'nixl' in src and 'mooncake' in src    # both branches present
-print('OK: p2p.py branches on backend')
+assert 'create_transfer_engine' in src
+print('OK: connect_rollout_engines branches on backend')
 "
 ```
 
-- **Checks:** the NIXL init helpers are called in `p2p.py` and the Mooncake path is still present.
-- **Expected:** prints `OK: p2p.py branches on backend`.
+- **Checks:** backend-specific metadata/handshake and transfer-object creation live in
+  `connect_rollout_engines()` while both backends remain present.
+- **Expected:** prints `OK: connect_rollout_engines branches on backend`.
 
 ### Test 3c — handshake completes against a live SGLang NIXL seed (e2e, needs GPU + NIXL + SGLang)
 
@@ -225,45 +247,61 @@ Then run Miles with `--update-weight-transfer-backend nixl` and a dry-run / hand
 
 ## Step 4 — CPU DRAM memory registration
 
-### Test 4a — registration helpers exist (static, no GPU)
+### Test 4a — NIXL registration helper exists (static, no GPU)
 
 ```bash
 python -c "
-from miles.p2p import p2p_transfer_utils as u
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import p2p_transfer_utils as u
 assert hasattr(u, 'register_cpu_memory_nixl')
-assert hasattr(u, 'deregister_cpu_memory_nixl')
-print('OK: registration helpers present')
+print('OK: NIXL registration helper present')
 "
 ```
 
-- **Checks:** both helpers are importable from `p2p_transfer_utils`.
-- **Expected:** prints `OK: registration helpers present`.
+- **Checks:** the one-time NIXL registration helper is importable from `p2p_transfer_utils`.
+- **Expected:** prints `OK: NIXL registration helper present`.
 
-### Test 4b — pinned tensor registers and deregisters without error (unit, needs NIXL)
+### Test 4b — prepare registers NIXL memory only once (unit, no GPU)
 
 ```bash
-python -c "import nixl; print('nixl importable')"   # gate first
 python -c "
-import torch
-from miles.p2p.p2p_transfer_utils import create_nixl_agent, register_cpu_memory_nixl, deregister_cpu_memory_nixl
-agent = create_nixl_agent()
-t = torch.zeros(1024, dtype=torch.float16).pin_memory()
-handles = register_cpu_memory_nixl(agent, [t])
-assert len(handles) == 1
-deregister_cpu_memory_nixl(agent, handles)
-print('OK: pinned tensor registered and deregistered')
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import p2p as p2p_mod
+
+obj = object.__new__(p2p_mod.UpdateWeightP2P)
+obj.transfer_plan = SimpleNamespace(_gathered_dp_rank=0, _rollout_num_gpus=1)
+obj.args = SimpleNamespace(update_weight_transfer_backend='nixl')
+obj._model_registered = False
+obj._shared_params_dict = {'w': MagicMock()}
+obj._nixl_agent = MagicMock()
+
+with patch.object(
+    p2p_mod.DistBucketedWeightUpdateMixin, '_pause_and_prepare_engines'
+), patch.object(
+    p2p_mod, 'register_cpu_memory_nixl', return_value={'w': (1, 2, 0)}
+) as register:
+    obj._pause_and_prepare_engines()
+    obj._pause_and_prepare_engines()
+
+assert register.call_count == 1
+assert obj._model_registered
+print('OK: NIXL memory registered once')
 "
 ```
 
-- **Checks:** a pinned CPU tensor registers as a DRAM region and cleanly deregisters.
-- **Expected:** prints `OK: pinned tensor registered and deregistered`.
+- **Checks:** `_pause_and_prepare_engines()` registers the persistent shared buffers only on its
+  first call.
+- **Expected:** prints `OK: NIXL memory registered once`.
 
 ### Test 4c — non-pinned tensor raises `AssertionError` (unit, needs NIXL)
 
 ```bash
 python -c "
 import torch
-from miles.p2p.p2p_transfer_utils import create_nixl_agent, register_cpu_memory_nixl
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    create_nixl_agent,
+    register_cpu_memory_nixl,
+)
 agent = create_nixl_agent()
 t = torch.zeros(1024, dtype=torch.float16)   # NOT pinned
 try:
@@ -279,38 +317,39 @@ except AssertionError:
 
 ---
 
-## Step 5 — NIXL WRITE transfer
+## Step 5 — Branch the existing P2P WRITE
 
 ### Test 5a — NIXL write path calls the 3-step API in the correct order (unit, no GPU)
 
 ```bash
 python -c "
 from unittest.mock import MagicMock
-import torch
-from miles.p2p.p2p_transfer_utils import RemoteWeightInfo
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    RemoteWeightInfo,
+)
 
 agent = MagicMock()
 agent.check_xfer_state.return_value = 'DONE'
 
 # construct a minimal P2P object without full init
-from miles.p2p import p2p as p2p_mod
-obj = object.__new__(p2p_mod.UpdateWeightP2P)   # adjust class name as needed
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import p2p as p2p_mod
+obj = object.__new__(p2p_mod.UpdateWeightP2P)
 obj._nixl_agent = agent
+obj._weight_memory_registry = {'layer.weight': (0xCAFE0000, 64, 2)}
 
-cpu_tensor = torch.zeros(64, dtype=torch.float16).pin_memory()
-remote_infos = {
-    'layer.weight': RemoteWeightInfo(
-        addr=0xDEAD0000, numel=64, element_size=2, device_id=1,
-        agent_name='sglang_worker_0', backend='nixl',
-    )
-}
-obj._transfer_weights_nixl({'layer.weight': cpu_tensor}, remote_infos)
+remote = RemoteWeightInfo(
+    session_id='sglang_worker_0',
+    weights_info={'layer.weight': (0xDEAD0000, 64, 2, 1)},
+    agent_name='sglang_worker_0',
+    backend='nixl',
+)
+obj._do_p2p_write_one_session(remote, ['layer.weight'])
 
 calls = [c[0] for c in agent.method_calls]
-assert 'get_xfer_descs' in str(calls)
-assert 'initialize_xfer' in str(calls)
-assert 'transfer' in str(calls)
-assert 'check_xfer_state' in str(calls)
+names = [str(call) for call in calls]
+order = ['get_xfer_descs', 'initialize_xfer', 'transfer', 'check_xfer_state']
+positions = [next(i for i, name in enumerate(names) if expected in name) for expected in order]
+assert positions == sorted(positions)
 print('OK: NIXL 3-step API called in order')
 "
 ```
@@ -323,24 +362,25 @@ print('OK: NIXL 3-step API called in order')
 ```bash
 python -c "
 from unittest.mock import MagicMock
-import torch
-from miles.p2p.p2p_transfer_utils import RemoteWeightInfo
-from miles.p2p import p2p as p2p_mod
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    RemoteWeightInfo,
+)
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import p2p as p2p_mod
 
 agent = MagicMock()
 agent.check_xfer_state.return_value = 'ERR'
 
 obj = object.__new__(p2p_mod.UpdateWeightP2P)
 obj._nixl_agent = agent
-cpu_tensor = torch.zeros(64, dtype=torch.float16).pin_memory()
-remote_infos = {
-    'layer.weight': RemoteWeightInfo(
-        addr=0xDEAD0000, numel=64, element_size=2, device_id=1,
-        agent_name='sglang_worker_0', backend='nixl',
-    )
-}
+obj._weight_memory_registry = {'layer.weight': (0xCAFE0000, 64, 2)}
+remote = RemoteWeightInfo(
+    session_id='sglang_worker_0',
+    weights_info={'layer.weight': (0xDEAD0000, 64, 2, 1)},
+    agent_name='sglang_worker_0',
+    backend='nixl',
+)
 try:
-    obj._transfer_weights_nixl({'layer.weight': cpu_tensor}, remote_infos)
+    obj._do_p2p_write_one_session(remote, ['layer.weight'])
     raise AssertionError('expected RuntimeError')
 except RuntimeError as e:
     assert 'layer.weight' in str(e) or 'NIXL' in str(e)
@@ -351,36 +391,45 @@ except RuntimeError as e:
 - **Checks:** `check_xfer_state` returning `"ERR"` raises `RuntimeError` with the parameter name.
 - **Expected:** prints `OK: ERR state raises RuntimeError`.
 
-### Test 5c — deregistration runs even when transfer raises (unit, no GPU)
+### Test 5c — transfer failure does not repeat registration (unit, no GPU)
 
 ```bash
 python -c "
 from unittest.mock import MagicMock, patch
-import torch
-from miles.p2p.p2p_transfer_utils import RemoteWeightInfo
-from miles.p2p import p2p as p2p_mod
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    RemoteWeightInfo,
+)
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import p2p as p2p_mod
 
 agent = MagicMock()
 agent.check_xfer_state.return_value = 'ERR'
 
 obj = object.__new__(p2p_mod.UpdateWeightP2P)
 obj._nixl_agent = agent
-cpu_tensor = torch.zeros(64, dtype=torch.float16).pin_memory()
-remote_infos = {
-    'w': RemoteWeightInfo(addr=0, numel=64, element_size=2, device_id=0,
-                          agent_name='peer', backend='nixl')
-}
-try:
-    obj._transfer_weights_nixl({'w': cpu_tensor}, remote_infos)
-except RuntimeError:
-    pass
-assert agent.deregister_memory.called, 'deregister_memory not called on error path'
-print('OK: deregistration runs in finally block')
+obj._model_registered = True
+obj._weight_memory_registry = {'w': (0xCAFE0000, 64, 2)}
+remote = RemoteWeightInfo(
+    session_id='peer',
+    weights_info={'w': (0xDEAD0000, 64, 2, 0)},
+    agent_name='peer',
+    backend='nixl',
+)
+
+with patch.object(p2p_mod, 'register_cpu_memory_nixl') as register:
+    try:
+        obj._do_p2p_write_one_session(remote, ['w'])
+    except RuntimeError:
+        pass
+
+assert obj._model_registered
+register.assert_not_called()
+print('OK: transfer failure leaves one-time registration intact')
 "
 ```
 
-- **Checks:** `deregister_cpu_memory_nixl` (i.e. `agent.deregister_memory`) is called even when the transfer raises.
-- **Expected:** prints `OK: deregistration runs in finally block`.
+- **Checks:** registration is not part of the write/error path and remains valid after a failed
+  transfer.
+- **Expected:** prints `OK: transfer failure leaves one-time registration intact`.
 
 ### Test 5d — Mooncake write path unchanged (regression, no GPU)
 
@@ -423,14 +472,14 @@ python examples/p2p_weight_transfer/run.py run Qwen/Qwen2-0.5B \
 | 3a | 3 | unit | no | yes | `create_nixl_agent` returns agent |
 | 3b | 3 | static | no | no | both branches in `p2p.py` |
 | 3c | 3 | e2e | yes | yes | `add_remote_agent` succeeds, no crash |
-| 4a | 4 | static | no | no | helpers importable |
-| 4b | 4 | unit | no | yes | pinned tensor registers + deregisters |
+| 4a | 4 | static | no | no | registration helper importable |
+| 4b | 4 | unit | no | no (mocked) | prepare registers only once |
 | 4c | 4 | unit | no | yes | non-pinned raises `AssertionError` |
 | 5a | 5 | unit | no | no (mocked) | 3-step API called in order |
 | 5b | 5 | unit | no | no (mocked) | `"ERR"` raises `RuntimeError` |
-| 5c | 5 | unit | no | no (mocked) | deregister runs in `finally` |
+| 5c | 5 | unit | no | no (mocked) | failure leaves registration intact |
 | 5d | 5 | unit | no | no | Mooncake suite passes unchanged |
 | 5e | 5 | e2e | yes | yes | `--check-weight-update-equal` passes |
 
-No-GPU tests (1a–1d, 2a–2c, 3b, 4a, 5a–5d) are automated by `run_tests_steps_1_4.sh`. The e2e
-tests (3c, 4b, 4c, 5e) need a container with GPUs and NIXL/UCX installed.
+No-GPU tests are listed as individual commands above. Tests 3a and 4c require NIXL but no GPU;
+tests 3c and 5e require a container with GPUs and NIXL/UCX installed.
