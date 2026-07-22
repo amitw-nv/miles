@@ -56,6 +56,7 @@ class UpdateWeightP2P(DistBucketedWeightUpdateMixin):
         is_lora: bool = False,
     ) -> None:
         self.args = args
+        self.transfer_backend = args.update_weight_transfer_backend
         self.model = model
         self.model_name = model_name
         self.quantization_config = quantization_config
