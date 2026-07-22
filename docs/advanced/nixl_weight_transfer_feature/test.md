@@ -105,9 +105,10 @@ engine = MagicMock()
 target = SimpleNamespace(engine_ind=0, engine_rank=0)
 
 # query result, parallelism info, then server info
+# ServerArgs requires model_path; the mock must include it.
 with patch(
     'miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils.ray.get',
-    side_effect=[response, {'tp_rank': 0}, {}],
+    side_effect=[response, {'tp_rank': 0}, {'model_path': 'dummy'}],
 ):
     remote_by_id, target_to_id, _ = query_remote_weight_infos([engine], [target])
 
@@ -123,7 +124,7 @@ print('OK: NIXL dict format parsed')
   the remote identity, and preserves the four-field destination metadata.
 - **Expected:** prints `OK: NIXL dict format parsed`.
 
-### Test 2b — `query_remote_weight_infos()` still parses Mooncake tuple format (unit, no GPU)
+### Test 2b — `query_remote_weight_infos()` parses Mooncake tagged dict format (unit, no GPU)
 
 ```bash
 python -c "
@@ -145,7 +146,7 @@ target = SimpleNamespace(engine_ind=0, engine_rank=0)
 
 with patch(
     'miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils.ray.get',
-    side_effect=[response, {'tp_rank': 0}, {}],
+    side_effect=[response, {'tp_rank': 0}, {'model_path': 'dummy'}],
 ):
     remote_by_id, target_to_id, _ = query_remote_weight_infos([engine], [target])
 
@@ -156,7 +157,7 @@ print('OK: Mooncake format still parsed')
 "
 ```
 
-- **Checks:** the existing Mooncake format continues to parse correctly after the Step 2 changes.
+- **Checks:** the tagged Mooncake dict with 3-field weight entries continues to parse correctly.
 - **Expected:** prints `OK: Mooncake format still parsed`.
 
 ### Test 2c — `RemoteWeightInfo` has new optional fields with correct defaults (static, no GPU)
@@ -176,6 +177,23 @@ print('OK: RemoteWeightInfo has new fields')
 
 - **Checks:** both new fields exist with the correct defaults so old call sites do not break.
 - **Expected:** prints `OK: RemoteWeightInfo has new fields`.
+
+### Test 2d — Miles-launched SGLang schema and real `ServerArgs` compatibility (mandatory E2E)
+
+This check is mandatory in the full NIXL E2E Test 5e; it is not an optional standalone Step 2 test.
+Step 2 alone cannot complete a NIXL Miles launch because agent connection, memory registration, and
+WRITE are implemented in Steps 3–5.
+
+When Test 5e launches Miles with `--mode nixl`, Miles launches the real SGLang seed and
+`UpdateWeightP2P.connect_rollout_engines()` must successfully call `query_remote_weight_infos()`
+against those real Ray actors. That call consumes the real transfer metadata, parallelism info, and
+server info and constructs the installed SGLang `ServerArgs`.
+
+- **Checks:** the Miles-launched SGLang returns tagged NIXL metadata with `agent_name`,
+  `agent_metadata`, and four-field weight entries; Miles parses it and constructs real `ServerArgs`
+  (including required `model_path`) before any transfer starts.
+- **Pass condition:** the connection phase of mandatory Test 5e completes. A schema mismatch,
+  missing `model_path`, or invalid `ServerArgs` aborts Test 5e and fails the feature E2E.
 
 ---
 
@@ -448,8 +466,10 @@ python examples/p2p_weight_transfer/run.py run Qwen/Qwen2-0.5B \
     --num-weight-updates 2
 ```
 
-- **Checks:** both weight-update iterations complete, `--check-weight-update-equal` reports no
-  mismatches, and no NIXL `ERR` state is logged.
+- **Checks:** Miles launches the real SGLang NIXL seed; its connection phase passes mandatory Test
+  2d by parsing live tagged metadata and constructing real `ServerArgs`; both weight-update
+  iterations complete, `--check-weight-update-equal` reports no mismatches, and no NIXL `ERR` state
+  is logged.
 - **Expected:** clean exit with a summary showing all parameter checks passed.
 - **Failure signatures:**
   - `AssertionError` from `--check-weight-update-equal` → weight data corrupted during transfer; check descriptor sizes and `device_id` values.
@@ -467,8 +487,9 @@ python examples/p2p_weight_transfer/run.py run Qwen/Qwen2-0.5B \
 | 1c | 1 | unit | no | no | `mooncake` is default mode |
 | 1d | 1 | static | no | no | correct URL, stale URL absent |
 | 2a | 2 | unit | no | no | NIXL dict parsed, `agent_name` populated |
-| 2b | 2 | unit | no | no | Mooncake tuple still parsed |
+| 2b | 2 | unit | no | no | Mooncake tagged dict still parsed |
 | 2c | 2 | static | no | no | new fields with correct defaults |
+| 2d | 2 | e2e (mandatory in 5e) | yes | yes | Miles-launched SGLang metadata parses with real `ServerArgs` |
 | 3a | 3 | unit | no | yes | `create_nixl_agent` returns agent |
 | 3b | 3 | static | no | no | both branches in `p2p.py` |
 | 3c | 3 | e2e | yes | yes | `add_remote_agent` succeeds, no crash |
@@ -482,4 +503,4 @@ python examples/p2p_weight_transfer/run.py run Qwen/Qwen2-0.5B \
 | 5e | 5 | e2e | yes | yes | `--check-weight-update-equal` passes |
 
 No-GPU tests are listed as individual commands above. Tests 3a and 4c require NIXL but no GPU;
-tests 3c and 5e require a container with GPUs and NIXL/UCX installed.
+tests 2d, 3c, and 5e require a container with GPUs and NIXL/UCX installed.

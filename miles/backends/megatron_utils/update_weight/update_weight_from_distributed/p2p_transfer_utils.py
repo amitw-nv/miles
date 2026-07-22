@@ -1,3 +1,4 @@
+import base64
 import dataclasses
 import logging
 from argparse import Namespace
@@ -137,7 +138,11 @@ class RemoteWeightInfo:
     """
 
     session_id: str
-    weights_info: dict[str, tuple[int, int, int]]  # name -> (remote_address, numel, element_size)
+    # Mooncake: (remote_address, numel, element_size)
+    # NIXL:     (remote_address, numel, element_size, device_id)
+    weights_info: dict[str, tuple[int, ...]]
+    agent_name: str = ""
+    backend: str = "mooncake"
 
 
 class P2PTransferManager:
@@ -212,27 +217,67 @@ def create_transfer_engine():
     return transfer_engine
 
 
+def add_nixl_remote_agent(nixl_agent, agent_metadata_b64: str):
+    """Decode SGLang's base64 agent metadata and register it with the local NIXL agent."""
+    raw = base64.b64decode(agent_metadata_b64)
+    return nixl_agent.add_remote_agent(raw)
+
+
+def _normalize_weights_info(weights_info_dict: dict) -> dict[str, tuple[int, ...]]:
+    """Convert JSON list entries to tuples; leave tuples unchanged."""
+    return {name: tuple(meta) for name, meta in weights_info_dict.items()}
+
+
+def _parse_remote_transfer_engine_info(info) -> tuple[str, dict[str, tuple[int, ...]], str, str | None]:
+    """Parse Mooncake/NIXL transfer-engine metadata from the tagged dict schema.
+
+    Returns ``(remote_id, weights_info, backend, agent_metadata_b64)``.
+    ``agent_metadata_b64`` is set only for the NIXL schema.
+    """
+    if not isinstance(info, dict):
+        raise TypeError(
+            f"Expected tagged transfer-engine info dict, got {type(info)!r}. "
+            "SGLang publishes backend-tagged dicts with weights_info_dict."
+        )
+    if "weights_info_dict" not in info:
+        raise ValueError(f"Unrecognized remote transfer engine info keys: {sorted(info)}")
+
+    backend = info.get("backend", "mooncake")
+    if backend not in ("mooncake", "nixl"):
+        raise ValueError(f"Unsupported transfer backend {backend!r}; expected 'mooncake' or 'nixl'")
+
+    weights_info = _normalize_weights_info(info["weights_info_dict"])
+    if backend == "nixl":
+        remote_id = info["agent_name"]
+        return remote_id, weights_info, backend, info.get("agent_metadata")
+    remote_id = info["session_id"]
+    return remote_id, weights_info, backend, None
+
+
 def query_remote_weight_infos(
     rollout_engines: Sequence[ActorHandle],
     targets,
 ) -> tuple[dict, dict, dict]:
-    """Query remote rollout engines for weight info, session IDs, and server args."""
+    """Query remote rollout engines for weight info, remote IDs, and server args.
+
+    Expects SGLang's backend-tagged dict schema (Mooncake or NIXL). For NIXL,
+    ``agent_name`` is used as the remote identity (parallel to Mooncake ``session_id``).
+    """
     remote_weight_infos_by_session_id = {}
     targets_to_session_id = {}
     session_id_to_server_args = {}
     targets_to_query = set((target.engine_ind, target.engine_rank) for target in targets)
 
     for engine_ind, engine_rank in targets_to_query:
-        session_id, weights_info = ray.get(
-            rollout_engines[engine_ind].get_remote_instance_transfer_engine_info.remote(rank=engine_rank)
-        )
+        info = ray.get(rollout_engines[engine_ind].get_remote_instance_transfer_engine_info.remote(rank=engine_rank))
         parallelism_info = ray.get(rollout_engines[engine_ind].get_parallelism_info.remote(rank=engine_rank))
+        remote_id, weights_info, _backend, _agent_metadata_b64 = _parse_remote_transfer_engine_info(info)
+        assert remote_id is not None, f"Failed to get remote id from rollout engine {engine_ind} rank {engine_rank}"
 
-        session_id_to_server_args[session_id] = create_server_args_from_dict(
+        session_id_to_server_args[remote_id] = create_server_args_from_dict(
             ray.get(rollout_engines[engine_ind].get_server_info.remote())
         )
-        assert session_id is not None, f"Failed to get session id from rollout engine {engine_ind} rank {engine_rank}"
-        remote_weight_infos_by_session_id[session_id] = (weights_info, parallelism_info)
-        targets_to_session_id[(engine_ind, engine_rank)] = session_id
+        remote_weight_infos_by_session_id[remote_id] = (weights_info, parallelism_info)
+        targets_to_session_id[(engine_ind, engine_rank)] = remote_id
 
     return remote_weight_infos_by_session_id, targets_to_session_id, session_id_to_server_args

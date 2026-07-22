@@ -39,15 +39,18 @@ results live in `test.md`.
 - Extend `RemoteWeightInfo` with two new optional fields: `agent_name: str = ""` and
   `backend: str = "mooncake"`.
 - Update `query_remote_weight_infos()` to detect `backend == "nixl"` in the HTTP response and
-  parse the 4-field dict format `{"addr", "numel", "element_size", "device_id"}`; keep backward
-  compatibility with the existing Mooncake 3-field tuple format.
+  parse the 4-field weight entries `{"addr", "numel", "element_size", "device_id"}`; continue
+  parsing SGLang's tagged Mooncake dict with 3-field weight entries.
 - Add `add_nixl_remote_agent(nixl_agent, agent_metadata_b64)`: base64-decode the string and call
   `nixl_agent.add_remote_agent(raw)`.
 
 **Tests** (details in `test.md`):
 - **2a** — `query_remote_weight_infos()` parses the NIXL dict format and populates `agent_name` and `backend`.
-- **2b** — `query_remote_weight_infos()` still parses the Mooncake tuple format unchanged (regression).
+- **2b** — `query_remote_weight_infos()` still parses the tagged Mooncake dict with 3-field weight
+  entries (regression).
 - **2c** — `RemoteWeightInfo` has the two new optional fields with the correct defaults.
+- **2d** — mandatory within the full NIXL E2E Test 5e: against the SGLang seed launched by Miles,
+  parse the real metadata and construct the installed SGLang `ServerArgs` from server info.
 
 ---
 
