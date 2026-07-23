@@ -269,7 +269,19 @@ print('OK: connect_rollout_engines branches on backend')
 
 ### Test 3c — handshake completes against a live SGLang NIXL seed (e2e, needs GPU + NIXL + SGLang)
 
-Launch SGLang with `--remote-instance-weight-loader-start-seed-via-nixl`, then run:
+`run_tests_step_3.sh` runs this automatically: it reuses an existing seed at
+`SGLANG_URL` if one is already up; otherwise it finds a local HF model under
+`/root/models` (or downloads `GLM-Z1-9B-0414` via `run.py prepare ... --download-only`),
+launches SGLang with `--remote-instance-weight-loader-start-seed-via-nixl`, runs the
+handshake, and tears the seed down.
+
+```bash
+./docs/advanced/nixl_weight_transfer_feature/run_tests_step_3.sh
+# optional override:
+# MODEL_PATH=/root/models/Qwen3-4B ./docs/advanced/nixl_weight_transfer_feature/run_tests_step_3.sh
+```
+
+Manual equivalent — launch SGLang with `--remote-instance-weight-loader-start-seed-via-nixl`, then:
 
 ```bash
 python -c "
@@ -301,6 +313,11 @@ print(f\"OK: add_remote_agent succeeded for {d['agent_name']}\")
   - `ConnectionRefused` → SGLang not started or wrong port.
   - `KeyError: 'agent_metadata'` → SGLang not in NIXL seed mode.
   - NIXL error in `add_remote_agent` → network or plugin issue; check UCX/IB config.
+
+**Can you run full `run.py --mode nixl` now?** Not yet for weight transfer. Step 3 only covers
+agent init + peer handshake. A full Miles launch still needs Steps 4-5 (CPU DRAM registration and
+NIXL WRITE) before the first weight update succeeds. Use this Step 3 runner for handshake
+validation now; keep `run.py --mode nixl --check-weight-update-equal` for Step 5e.
 
 ---
 
