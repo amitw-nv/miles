@@ -89,11 +89,11 @@ echo "repo=${REPO_ROOT}"
 echo "================================================================"
 
 # 2a — NIXL dict format
-run_py "2a" "query_remote_weight_infos parses NIXL dict format" '
+run_py "2a" "query_remote_weight_infos_nixl parses NIXL dict format" '
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-query_remote_weight_infos = _ptu.query_remote_weight_infos
+query_remote_weight_infos_nixl = _ptu.query_remote_weight_infos_nixl
 
 response = {
     "backend": "nixl",
@@ -105,18 +105,20 @@ response = {
 }
 engine = MagicMock()
 target = SimpleNamespace(engine_ind=0, engine_rank=0)
+nixl_agent = MagicMock()
 
 with patch.object(
     _ptu.ray,
     "get",
     side_effect=[response, {"tp_rank": 0}, {"model_path": "dummy"}],
 ):
-    remote_by_id, target_to_id, _ = query_remote_weight_infos([engine], [target])
+    remote_by_id, target_to_id, _ = query_remote_weight_infos_nixl([engine], [target], nixl_agent)
 
 remote_id = target_to_id[(0, 0)]
 assert remote_id == "sglang_worker_0"
 weights_info = remote_by_id[remote_id][0]
 assert weights_info["model.embed_tokens.weight"] == (140000000000, 131072, 2, 0)
+assert nixl_agent.add_remote_agent.called
 print("OK: NIXL dict format parsed")
 '
 

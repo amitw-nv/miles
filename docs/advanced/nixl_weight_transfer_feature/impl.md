@@ -38,14 +38,14 @@ results live in `test.md`.
 
 - Extend `RemoteWeightInfo` with two new optional fields: `agent_name: str = ""` and
   `backend: str = "mooncake"`.
-- Update `query_remote_weight_infos()` to detect `backend == "nixl"` in the HTTP response and
-  parse the 4-field weight entries `{"addr", "numel", "element_size", "device_id"}`; continue
-  parsing SGLang's tagged Mooncake dict with 3-field weight entries.
+- Keep `query_remote_weight_infos()` on the Mooncake tagged dict with 3-field weight entries.
+- Add `query_remote_weight_infos_nixl()` (parallel helper) to parse NIXL 4-field weight entries
+  `{"addr", "numel", "element_size", "device_id"}` and complete `add_nixl_remote_agent` handshake.
 - Add `add_nixl_remote_agent(nixl_agent, agent_metadata_b64)`: base64-decode the string and call
   `nixl_agent.add_remote_agent(raw)`.
 
 **Tests** (details in `test.md`):
-- **2a** — `query_remote_weight_infos()` parses the NIXL dict format and populates `agent_name` and `backend`.
+- **2a** — `query_remote_weight_infos_nixl()` parses the NIXL dict format and populates `agent_name`.
 - **2b** — `query_remote_weight_infos()` still parses the tagged Mooncake dict with 3-field weight
   entries (regression).
 - **2c** — `RemoteWeightInfo` has the two new optional fields with the correct defaults.
@@ -61,13 +61,13 @@ results live in `test.md`.
 - Add `create_nixl_agent()` in `p2p_transfer_utils.py`: construct and return a `nixl.Agent` instance.
 - In `UpdateWeightP2P.connect_rollout_engines()`, after the shared `plan_p2p()` call, branch on
   `transfer_backend`:
-  - `"nixl"` → call `create_nixl_agent()` once, then loop over all targets returned by `plan_p2p()`:
-    for each `(engine_ind, engine_rank)` target, query the SGLang metadata endpoint to get
-    `agent_name`, `agent_metadata`, and `weights_info_dict`; call `add_nixl_remote_agent()` with the
-    decoded blob; collect `ServerArgs` via `get_server_info` Ray call per engine (same as Mooncake).
-    Build and store an `agent_name → weights_info_dict` map and an `agent_name → ServerArgs` map
-    (parallel to Mooncake's `session_id → weights_info` and `session_id → ServerArgs`). The handshake
-    loop runs once during connection, not per weight-update iteration.
+  - `"nixl"` → call `create_nixl_agent()` once, then call `query_remote_weight_infos_nixl()`
+    (parallel to Mooncake's `query_remote_weight_infos()`): that helper loops over all targets
+    returned by `plan_p2p()`, queries the SGLang metadata endpoint for `agent_name`,
+    `agent_metadata`, and `weights_info_dict`, calls `add_nixl_remote_agent()` with the decoded
+    blob, and collects `ServerArgs` via `get_server_info` Ray call per engine. It returns the same
+    three map shapes as Mooncake, keyed by `agent_name` (parallel to Mooncake `session_id`). The
+    handshake loop runs once during connection, not per weight-update iteration.
   - `"mooncake"` → call the existing `query_remote_weight_infos()` and
     `create_transfer_engine()` path unchanged.
 - Keep `_create_cpu_replica()`, format conversion, and `_transfer_engine_meta_list` construction

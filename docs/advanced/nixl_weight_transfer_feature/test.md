@@ -83,14 +83,14 @@ print('OK: endpoint URL correct')
 
 ## Step 2 — Schema consumer: `RemoteWeightInfo` + query function
 
-### Test 2a — `query_remote_weight_infos()` parses NIXL dict format (unit, no GPU)
+### Test 2a — `query_remote_weight_infos_nixl()` parses NIXL dict format (unit, no GPU)
 
 ```bash
 python -c "
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
-    query_remote_weight_infos,
+    query_remote_weight_infos_nixl,
 )
 
 response = {
@@ -103,6 +103,7 @@ response = {
 }
 engine = MagicMock()
 target = SimpleNamespace(engine_ind=0, engine_rank=0)
+nixl_agent = MagicMock()
 
 # query result, parallelism info, then server info
 # ServerArgs requires model_path; the mock must include it.
@@ -110,18 +111,19 @@ with patch(
     'miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils.ray.get',
     side_effect=[response, {'tp_rank': 0}, {'model_path': 'dummy'}],
 ):
-    remote_by_id, target_to_id, _ = query_remote_weight_infos([engine], [target])
+    remote_by_id, target_to_id, _ = query_remote_weight_infos_nixl([engine], [target], nixl_agent)
 
 remote_id = target_to_id[(0, 0)]
 assert remote_id == 'sglang_worker_0'
 weights_info = remote_by_id[remote_id][0]
 assert weights_info['model.embed_tokens.weight'] == (140000000000, 131072, 2, 0)
+assert nixl_agent.add_remote_agent.called
 print('OK: NIXL dict format parsed')
 "
 ```
 
-- **Checks:** the existing Ray-actor query contract accepts the NIXL response, uses `agent_name` as
-  the remote identity, and preserves the four-field destination metadata.
+- **Checks:** the NIXL query/handshake helper accepts the NIXL response, uses `agent_name` as
+  the remote identity, preserves the four-field destination metadata, and calls `add_remote_agent`.
 - **Expected:** prints `OK: NIXL dict format parsed`.
 
 ### Test 2b — `query_remote_weight_infos()` parses Mooncake tagged dict format (unit, no GPU)
@@ -185,7 +187,7 @@ Step 2 alone cannot complete a NIXL Miles launch because agent connection, memor
 WRITE are implemented in Steps 3–5.
 
 When Test 5e launches Miles with `--mode nixl`, Miles launches the real SGLang seed and
-`UpdateWeightP2P.connect_rollout_engines()` must successfully call `query_remote_weight_infos()`
+`UpdateWeightP2P.connect_rollout_engines()` must successfully call `query_remote_weight_infos_nixl()`
 against those real Ray actors. That call consumes the real transfer metadata, parallelism info, and
 server info and constructs the installed SGLang `ServerArgs`.
 
@@ -220,42 +222,81 @@ print('OK: create_nixl_agent returns agent')
 
 ```bash
 python -c "
-import inspect
-from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p import (
-    UpdateWeightP2P,
+import ast
+from pathlib import Path
+
+p2p_src = Path(
+    'miles/backends/megatron_utils/update_weight/'
+    'update_weight_from_distributed/p2p.py'
+).read_text()
+p2p_tree = ast.parse(p2p_src)
+cls = next(n for n in p2p_tree.body if isinstance(n, ast.ClassDef) and n.name == 'UpdateWeightP2P')
+connect = next(
+    n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'connect_rollout_engines'
 )
-src = inspect.getsource(UpdateWeightP2P.connect_rollout_engines)
-assert 'create_nixl_agent' in src
-assert 'add_nixl_remote_agent' in src
-assert 'create_transfer_engine' in src
+calls = {
+    n.func.id
+    for n in ast.walk(connect)
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+}
+assert {'create_nixl_agent', 'query_remote_weight_infos_nixl',
+        'query_remote_weight_infos', 'create_transfer_engine'} <= calls
+
+utils_src = Path(
+    'miles/backends/megatron_utils/update_weight/'
+    'update_weight_from_distributed/p2p_transfer_utils.py'
+).read_text()
+utils_tree = ast.parse(utils_src)
+nixl_query = next(
+    n for n in utils_tree.body
+    if isinstance(n, ast.FunctionDef) and n.name == 'query_remote_weight_infos_nixl'
+)
+nixl_calls = {
+    n.func.id
+    for n in ast.walk(nixl_query)
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+}
+assert 'add_nixl_remote_agent' in nixl_calls
 print('OK: connect_rollout_engines branches on backend')
 "
 ```
 
 - **Checks:** backend-specific metadata/handshake and transfer-object creation live in
-  `connect_rollout_engines()` while both backends remain present.
+  `connect_rollout_engines()` while both backends remain present; NIXL target loop +
+  `add_nixl_remote_agent` live in `query_remote_weight_infos_nixl` (parallel to Mooncake's
+  `query_remote_weight_infos`).
 - **Expected:** prints `OK: connect_rollout_engines branches on backend`.
 
 ### Test 3c — handshake completes against a live SGLang NIXL seed (e2e, needs GPU + NIXL + SGLang)
 
-Launch SGLang with `--remote-instance-weight-loader-start-seed-via-nixl`, then:
+Launch SGLang with `--remote-instance-weight-loader-start-seed-via-nixl`, then run:
 
 ```bash
-curl -s "http://localhost:30000/remote_instance_transfer_engine_info?rank=0" | python -c "
-import sys, json, base64
-d = json.load(sys.stdin)['remote_instance_transfer_engine_info']
+python -c "
+import urllib.request
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    add_nixl_remote_agent,
+    create_nixl_agent,
+)
+
+url = 'http://localhost:30000/remote_instance_transfer_engine_info?rank=0'
+with urllib.request.urlopen(url, timeout=5) as response:
+    import json
+    d = json.load(response)['remote_instance_transfer_engine_info']
+
 assert d['backend'] == 'nixl', d.get('backend')
-raw = base64.b64decode(d['agent_metadata'])
-assert len(raw) > 0
-print('OK: SGLang NIXL endpoint valid')
+assert d['agent_name']
+assert d['agent_metadata']
+
+agent = create_nixl_agent()
+add_nixl_remote_agent(agent, d['agent_metadata'])
+print(f\"OK: add_remote_agent succeeded for {d['agent_name']}\")
 "
 ```
 
-Then run Miles with `--update-weight-transfer-backend nixl` and a dry-run / handshake-only mode.
-
 - **Checks:** Miles queries the endpoint, decodes `agent_metadata`, calls `add_remote_agent`, and
   no exception is raised. Miles log must contain a line indicating the remote agent was added.
-- **Expected:** no crash; log shows `add_remote_agent succeeded` (or equivalent).
+- **Expected:** no crash; prints `OK: add_remote_agent succeeded for <agent_name>`.
 - **Failure signatures:**
   - `ConnectionRefused` → SGLang not started or wrong port.
   - `KeyError: 'agent_metadata'` → SGLang not in NIXL seed mode.

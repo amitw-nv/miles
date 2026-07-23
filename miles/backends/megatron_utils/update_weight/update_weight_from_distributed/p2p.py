@@ -26,8 +26,10 @@ from .p2p_transfer_utils import (
     P2PTransferManager,
     RemoteTransferPlan,
     RemoteWeightInfo,
+    create_nixl_agent,
     create_transfer_engine,
     query_remote_weight_infos,
+    query_remote_weight_infos_nixl,
     register_cpu_memory,
 )
 
@@ -200,18 +202,29 @@ class UpdateWeightP2P(DistBucketedWeightUpdateMixin):
         if self._is_source:
             self._group_name = f"miles-p2p_{self.transfer_plan._gathered_dp_rank}"
             targets = self.transfer_plan.plan_p2p()
-            (
-                self.remote_weight_infos_by_session_id,
-                targets_to_session_id,
-                self.session_id_to_server_args,
-            ) = query_remote_weight_infos(rollout_engines, targets)
+
+            if self.transfer_backend == "nixl":
+                self._nixl_agent = create_nixl_agent()
+                (
+                    self.remote_weight_infos_by_session_id,
+                    targets_to_session_id,
+                    self.session_id_to_server_args,
+                ) = query_remote_weight_infos_nixl(rollout_engines, targets, self._nixl_agent)
+            elif self.transfer_backend == "mooncake":
+                (
+                    self.remote_weight_infos_by_session_id,
+                    targets_to_session_id,
+                    self.session_id_to_server_args,
+                ) = query_remote_weight_infos(rollout_engines, targets)
+                # Create ONE transfer engine for all engine ranks
+                self._transfer_engine = create_transfer_engine()
+            else:
+                raise ValueError(f"Unsupported P2P transfer backend: {self.transfer_backend!r}")
 
             targets_grouped_by_engine_rank: dict[int, list] = {}
             for target in targets:
                 targets_grouped_by_engine_rank.setdefault(target.engine_rank, []).append(target)
 
-            # Create ONE transfer engine for all engine ranks
-            self._transfer_engine = create_transfer_engine()
             self._shared_params_dict: dict[str, torch.Tensor] = {}
             self._shared_param_mapper: ParameterMapper | None = None
             # in self._transfer_engine_meta_list: tuple of
@@ -244,6 +257,12 @@ class UpdateWeightP2P(DistBucketedWeightUpdateMixin):
                         self.remote_weight_infos_by_session_id[targets_to_session_id[(t.engine_ind, t.engine_rank)]][
                             0
                         ],
+                        agent_name=(
+                            targets_to_session_id[(t.engine_ind, t.engine_rank)]
+                            if self.transfer_backend == "nixl"
+                            else ""
+                        ),
+                        backend=self.transfer_backend,
                     )
                     for t in rank_targets
                 ]
