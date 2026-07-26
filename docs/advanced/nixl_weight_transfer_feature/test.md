@@ -323,6 +323,14 @@ validation now; keep `run.py --mode nixl --check-weight-update-equal` for Step 5
 
 ## Step 4 — CPU DRAM memory registration
 
+`run_tests_step_4.sh` runs every Step 4 test. It stubs missing third-party deps (torch, ray,
+mooncake, sglang, megatron, …) so the registration logic is exercised outside the container, and
+skips — never fakes — the tests that need real NIXL:
+
+```bash
+./docs/advanced/nixl_weight_transfer_feature/run_tests_step_4.sh
+```
+
 ### Test 4a — NIXL registration helper exists (static, no GPU)
 
 ```bash
@@ -347,6 +355,7 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed 
 obj = object.__new__(p2p_mod.UpdateWeightP2P)
 obj.transfer_plan = SimpleNamespace(_gathered_dp_rank=0, _rollout_num_gpus=1)
 obj.args = SimpleNamespace(update_weight_transfer_backend='nixl')
+obj.transfer_backend = 'nixl'   # normally set from args in __init__, bypassed here
 obj._model_registered = False
 obj._shared_params_dict = {'w': MagicMock()}
 obj._nixl_agent = MagicMock()
@@ -369,7 +378,11 @@ print('OK: NIXL memory registered once')
   first call.
 - **Expected:** prints `OK: NIXL memory registered once`.
 
-### Test 4c — non-pinned tensor raises `AssertionError` (unit, needs NIXL)
+### Test 4c — real NIXL agent registration, pinned and non-pinned (unit, needs NIXL)
+
+`register_cpu_memory_nixl(nixl_agent, params_dict)` takes the same `{name: tensor}` dict as
+Mooncake's `register_cpu_memory(params_dict, transfer_engine)`, so tests pass a dict, never a bare
+tensor list.
 
 ```bash
 python -c "
@@ -379,17 +392,89 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.
     register_cpu_memory_nixl,
 )
 agent = create_nixl_agent()
+
 t = torch.zeros(1024, dtype=torch.float16)   # NOT pinned
 try:
-    register_cpu_memory_nixl(agent, [t])
-    raise RuntimeError('expected AssertionError')
+    register_cpu_memory_nixl(agent, {'layer.weight': t})
 except AssertionError:
     print('OK: non-pinned tensor rejected')
+else:
+    raise RuntimeError('expected AssertionError')
+
+if torch.cuda.is_available():   # pinning needs a CUDA driver
+    pinned = torch.zeros(1024, dtype=torch.float16).pin_memory()
+    registry = register_cpu_memory_nixl(agent, {'layer.weight': pinned})
+    assert registry == {'layer.weight': (pinned.data_ptr(), 1024, 2)}
+    print('OK: pinned tensor registered by a real NIXL agent')
 "
 ```
 
-- **Checks:** the pinned-memory precondition is enforced with a clear error.
-- **Expected:** prints `OK: non-pinned tensor rejected`.
+- **Checks:** the pinned-memory precondition is enforced with a clear error, and — when a CUDA
+  driver is present to pin with — a real agent accepts our DRAM descriptor and returns the expected
+  source metadata. This is the only test that exercises `register_memory` against real NIXL.
+- **Expected:** prints `OK: non-pinned tensor rejected`, plus the pinned line where CUDA exists.
+
+### Test 4d — DRAM registration arguments and source metadata (unit, no GPU, no NIXL)
+
+```bash
+python -c "
+from unittest.mock import MagicMock
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.p2p_transfer_utils import (
+    register_cpu_memory_nixl,
+)
+
+class FakeTensor:
+    def is_pinned(self): return True
+    def data_ptr(self): return 0xCAFE0000
+    def numel(self): return 64
+    def element_size(self): return 2
+
+agent = MagicMock()
+registry = register_cpu_memory_nixl(agent, {'layer.weight': FakeTensor()})
+agent.register_memory.assert_called_once_with([(0xCAFE0000, 128, 0, '')], 'DRAM')
+assert registry == {'layer.weight': (0xCAFE0000, 64, 2)}
+print('OK: DRAM regions registered with device_id 0')
+"
+```
+
+- **Checks:** each pinned tensor is registered as a single `(addr, size, 0, "")` DRAM region, and the
+  returned source metadata has the same `(addr, numel, element_size)` shape as the Mooncake registry
+  so the write path stays shared. The runner also asserts a non-pinned tensor is rejected before any
+  `register_memory` call, which keeps the precondition covered where NIXL is absent.
+- **Expected:** prints `OK: DRAM regions registered with device_id 0`.
+
+### Test 4e — registration stays one-time and out of the write path (static, no GPU)
+
+```bash
+python -c "
+import ast
+from pathlib import Path
+
+tree = ast.parse(Path(
+    'miles/backends/megatron_utils/update_weight/'
+    'update_weight_from_distributed/p2p.py'
+).read_text())
+cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'UpdateWeightP2P')
+prepare = next(
+    n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_pause_and_prepare_engines'
+)
+calls = {n.func.id for n in ast.walk(prepare) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+assert {'register_cpu_memory_nixl', 'register_cpu_memory'} <= calls
+assert '_model_registered' in ast.dump(prepare)
+assert 'transfer_backend' in ast.dump(prepare)
+
+write = next(
+    n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_do_p2p_write_one_session'
+)
+assert 'register_memory' not in ast.dump(write)
+print('OK: registration branches on backend and stays out of the write path')
+"
+```
+
+- **Checks:** both backends are registered from the same `_model_registered`-guarded branch in
+  `_pause_and_prepare_engines()`, and the per-update write path never registers or deregisters
+  memory.
+- **Expected:** prints `OK: registration branches on backend and stays out of the write path`.
 
 ---
 
@@ -553,7 +638,9 @@ python examples/p2p_weight_transfer/run.py run Qwen/Qwen2-0.5B \
 | 3c | 3 | e2e | yes | yes | `add_remote_agent` succeeds, no crash |
 | 4a | 4 | static | no | no | registration helper importable |
 | 4b | 4 | unit | no | no (mocked) | prepare registers only once |
-| 4c | 4 | unit | no | yes | non-pinned raises `AssertionError` |
+| 4c | 4 | unit | pinned half only | yes | non-pinned raises `AssertionError`; real agent registers pinned DRAM |
+| 4d | 4 | unit | no | no (fakes) | `(addr, size, 0, "")` DRAM region + source metadata |
+| 4e | 4 | static | no | no | one-time branch present, write path registration-free |
 | 5a | 5 | unit | no | no (mocked) | 3-step API called in order |
 | 5b | 5 | unit | no | no (mocked) | `"ERR"` raises `RuntimeError` |
 | 5c | 5 | unit | no | no (mocked) | failure leaves registration intact |

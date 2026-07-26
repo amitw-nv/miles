@@ -212,6 +212,23 @@ def register_cpu_memory(params_dict: dict, transfer_engine) -> dict:
     return weight_dict
 
 
+def register_cpu_memory_nixl(nixl_agent, params_dict: dict) -> dict:
+    """Register CPU pinned memory with the NIXL agent as DRAM regions."""
+    weight_dict = {}
+
+    for name, cpu_tensor in params_dict.items():
+        assert cpu_tensor.is_pinned(), (
+            f"NIXL DRAM registration requires pinned CPU memory, but weight {name} is not pinned."
+        )
+        addr = cpu_tensor.data_ptr()
+        size = cpu_tensor.numel() * cpu_tensor.element_size()
+        # device_id is 0 for every DRAM region.
+        nixl_agent.register_memory([(addr, size, 0, "")], "DRAM")
+        weight_dict[name] = (addr, cpu_tensor.numel(), cpu_tensor.element_size())
+
+    return weight_dict
+
+
 def create_transfer_engine():
     transfer_engine = TransferEngine()
     local_ip = ray._private.services.get_node_ip_address()

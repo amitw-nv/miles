@@ -157,7 +157,8 @@ Per touch point, the smallest change that makes NIXL work. Nothing is duplicated
 
 ### 4.4 CPU DRAM registration (branch in one helper)
 
-- Add `register_cpu_memory_nixl(nixl_agent, tensors)` in `p2p_transfer_utils.py`.
+- Add `register_cpu_memory_nixl(nixl_agent, params_dict)` in `p2p_transfer_utils.py`, mirroring
+  `register_cpu_memory`'s `{name: tensor}` input and `{name: (addr, numel, element_size)}` output.
 - Tensors must be pinned; `device_id = 0` for all DRAM regions.
 - `_pause_and_prepare_engines()` registers the shared CPU buffers on its first call, mirroring
   Mooncake's one-time registration. The buffers and registration remain valid for subsequent

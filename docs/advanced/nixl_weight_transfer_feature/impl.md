@@ -86,10 +86,11 @@ results live in `test.md`.
 
 **Files:** `miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p_transfer_utils.py`, `miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py`
 
-- Add `register_cpu_memory_nixl(nixl_agent, tensors)` in `p2p_transfer_utils.py`: call
-  `agent.register_memory([(addr, size, 0, "")], "DRAM")` for each shared pinned CPU tensor and
-  return the source metadata needed by the write path. Assert tensors are pinned; `device_id = 0`
-  for all DRAM regions.
+- Add `register_cpu_memory_nixl(nixl_agent, params_dict)` in `p2p_transfer_utils.py`, taking the same
+  `{name: tensor}` dict as `register_cpu_memory` and returning the same
+  `{name: (addr, numel, element_size)}` registry: call
+  `agent.register_memory([(addr, size, 0, "")], "DRAM")` for each shared pinned CPU tensor. Assert
+  tensors are pinned; `device_id = 0` for all DRAM regions.
 - In `UpdateWeightP2P._pause_and_prepare_engines()`, branch on `transfer_backend` when
   `_model_registered` is false: call `register_cpu_memory_nixl()` for NIXL or the existing
   `register_cpu_memory()` for Mooncake, then set `_model_registered = True`.
@@ -100,7 +101,12 @@ results live in `test.md`.
 - **4a** — `register_cpu_memory_nixl` exists and produces source metadata for a pinned tensor
   (requires NIXL).
 - **4b** — `_pause_and_prepare_engines()` registers NIXL memory only on its first call.
-- **4c** — non-pinned tensor raises `AssertionError` with a clear message (requires NIXL).
+- **4c** — non-pinned tensor raises `AssertionError` with a clear message, and a real agent registers
+  a pinned tensor where a CUDA driver exists to pin with (requires NIXL).
+- **4d** — registration passes `(addr, size, 0, "")` as a `"DRAM"` region and returns
+  `(addr, numel, element_size)` source metadata (fake agent, no NIXL).
+- **4e** — the one-time branch lives in `_pause_and_prepare_engines()` and the per-update write path
+  registers nothing.
 
 ---
 

@@ -31,6 +31,7 @@ from .p2p_transfer_utils import (
     query_remote_weight_infos,
     query_remote_weight_infos_nixl,
     register_cpu_memory,
+    register_cpu_memory_nixl,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,13 +113,16 @@ class UpdateWeightP2P(DistBucketedWeightUpdateMixin):
         )
 
     def _pause_and_prepare_engines(self):
-        """Register shared CPU pinned memory with P2P on first call."""
+        """Register shared CPU pinned memory with the active P2P backend on first call."""
         super()._pause_and_prepare_engines()
         if not self._is_source:
             return
 
         if not self._model_registered:
-            self._weight_memory_registry = register_cpu_memory(self._shared_params_dict, self._transfer_engine)
+            if self.transfer_backend == "nixl":
+                self._weight_memory_registry = register_cpu_memory_nixl(self._nixl_agent, self._shared_params_dict)
+            else:
+                self._weight_memory_registry = register_cpu_memory(self._shared_params_dict, self._transfer_engine)
         self._model_registered = True
 
     def _finalize_and_resume_engines(self):
