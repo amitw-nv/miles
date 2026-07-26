@@ -6,15 +6,17 @@
 #   ./docs/advanced/nixl_weight_transfer_feature/run_tests_step_4.sh
 #
 # Runs all Step 4 tests:
-#   4a — register_cpu_memory_nixl is importable from p2p_transfer_utils (always)
+#   4a — register_cpu_memory_nixl is importable from p2p_transfer_utils (needs p2p_transfer_utils)
 #   4b — _pause_and_prepare_engines registers NIXL memory only once (needs importable p2p.py)
 #   4c — real NIXL agent registration, pinned and non-pinned (needs NIXL + torch;
 #        the pinned half additionally needs a CUDA driver)
-#   4d — DRAM registration args and returned source metadata (always, fake agent + tensors)
+#   4d — DRAM registration args and returned source metadata (fake agent + tensors)
 #   4e — _pause_and_prepare_engines branch structure (always, AST only)
 #
-# Heavy third-party deps (torch, ray, mooncake, sglang, megatron, ...) are stubbed when
-# missing so the schema/registration logic can still be exercised outside the container.
+# Inside the container every dependency is real and nothing is stubbed. Outside it, a heavy
+# third-party dep (torch, ray, mooncake, sglang, megatron, ...) is stubbed only once its absence
+# has actually broken the import of the module under test, so third-party probes for optional
+# modules keep failing as their authors intended.
 # Tests that need a real dependency are reported as SKIP, never as PASS.
 #
 # Note: a full Miles `run.py --mode nixl` weight-update E2E still needs Step 5.
@@ -46,23 +48,24 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# miles must always resolve for real; nixl-dependent tests must skip rather than run
-# against a mock; deep_ep is monkey-patched at import time by miles.backends.megatron_utils,
-# which only works on the real package or its ImportError fallback.
+# Roots that must never be stubbed: miles is the code under test, nixl-dependent tests must
+# skip rather than run against a mock, and deep_ep is monkey-patched at import time by
+# miles.backends.megatron_utils, which needs either the real package or its ImportError path.
 _NEVER_STUB = {"miles", "nixl", "deep_ep"}
+
+# Filled in only by _import_with_stubs, one root per import that actually failed. Blanket
+# stubbing is not safe: third-party code probes for optional modules (_winapi, simplejson, ...)
+# and a stub that answers those probes sends it down a wrong branch.
+_stub_roots: set[str] = set()
 
 
 class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Resolve otherwise-missing third-party modules to MagicMock stand-ins.
-
-    Appended to sys.meta_path, so it is consulted only for modules no real finder
-    could locate: inside the container every dependency imports normally.
-    """
+    """Resolve an explicit set of missing third-party modules to MagicMock stand-ins."""
 
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split(".")[0] in _NEVER_STUB:
-            return None
-        return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
+        if fullname.split(".")[0] in _stub_roots:
+            return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
+        return None
 
     def create_module(self, spec):
         module = MagicMock(name=spec.name)
@@ -102,21 +105,60 @@ def _load_standalone(path, name):
     return module
 
 
-try:
+def _import_with_stubs(do_import, attempts=40):
+    """Import, stubbing whichever missing third-party module blocks progress, and retrying.
+
+    Inside the container every dependency is installed, so the first attempt succeeds and no
+    stub is ever created. Only modules whose absence propagates out of our own import chain get
+    stubbed, which leaves third-party optional-dependency probes untouched.
+    """
+    while True:
+        try:
+            return do_import()
+        except ModuleNotFoundError as e:
+            root = (e.name or "").split(".")[0]
+            if not root or root in _NEVER_STUB or root in _stub_roots or attempts <= 0:
+                raise
+            _stub_roots.add(root)
+            attempts -= 1
+
+
+def _import_utils():
     from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import (
-        p2p_transfer_utils as _ptu,
+        p2p_transfer_utils,
     )
-except Exception:
-    # Bypass package __init__ side effects by loading the file as a standalone module.
-    for _name in ("miles.backends.training_utils", "miles.backends.training_utils.parallel"):
-        if _name not in sys.modules:
-            _stub_module(_name)
-    _ptu = _load_standalone(_UTILS_PATH, "p2p_transfer_utils_under_test")
+
+    return p2p_transfer_utils
+
+
+def _import_p2p():
+    from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import p2p
+
+    return p2p
+
+
+_ptu = None
+_p2p = None
+_UTILS_IMPORT_ERROR = None
+_P2P_IMPORT_ERROR = None
 
 try:
-    from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import p2p as _p2p
+    _ptu = _import_with_stubs(_import_utils)
+except Exception as _utils_error:
+    _UTILS_IMPORT_ERROR = _utils_error
+    try:
+        # Bypass package __init__ side effects by loading the file as a standalone module.
+        for _name in ("miles.backends.training_utils", "miles.backends.training_utils.parallel"):
+            if _name not in sys.modules:
+                _stub_module(_name)
+        _ptu = _import_with_stubs(lambda: _load_standalone(_UTILS_PATH, "p2p_transfer_utils_under_test"))
+        _UTILS_IMPORT_ERROR = None
+    except Exception as _standalone_error:
+        _UTILS_IMPORT_ERROR = _standalone_error
+
+try:
+    _p2p = _import_with_stubs(_import_p2p)
 except Exception as _p2p_error:
-    _p2p = None
     _P2P_IMPORT_ERROR = _p2p_error
 
 
@@ -190,12 +232,16 @@ has_torch() {
     python -c "import torch" >/dev/null 2>&1
 }
 
-has_p2p_module() {
+# Print nothing when the module under test is available, otherwise the blocking import error.
+module_error() {
     python -c "${IMPORT_PREAMBLE}
-import sys
-sys.exit(0 if _p2p is not None else 1)
-" >/dev/null 2>&1
+module, error = (_ptu, _UTILS_IMPORT_ERROR) if \"$1\" == \"utils\" else (_p2p, _P2P_IMPORT_ERROR)
+print(\"\" if module is not None else f\"{type(error).__name__}: {error}\")
+" 2>/dev/null | tail -n 1
 }
+
+UTILS_ERROR="$(module_error utils)"
+P2P_ERROR="$(module_error p2p)"
 
 echo "================================================================"
 echo "Miles NIXL weight-transfer tests: Step 4"
@@ -203,13 +249,18 @@ echo "repo=${REPO_ROOT}"
 echo "================================================================"
 
 # 4a — the one-time NIXL registration helper is importable
-run_py "4a" "register_cpu_memory_nixl is importable" '
+if [ -n "${UTILS_ERROR}" ]; then
+    record_skip "4a" "register_cpu_memory_nixl is importable" \
+        "p2p_transfer_utils.py cannot be imported here (${UTILS_ERROR})"
+else
+    run_py "4a" "register_cpu_memory_nixl is importable" '
 assert hasattr(_ptu, "register_cpu_memory_nixl"), "register_cpu_memory_nixl missing"
 print("OK: NIXL registration helper present")
 '
+fi
 
 # 4b — prepare registers the shared buffers exactly once
-if has_p2p_module; then
+if [ -z "${P2P_ERROR}" ]; then
     run_py "4b" "_pause_and_prepare_engines registers NIXL memory once" '
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -240,7 +291,7 @@ print("OK: NIXL memory registered once")
 '
 else
     record_skip "4b" "_pause_and_prepare_engines registers NIXL memory once" \
-        "p2p.py imports cannot be satisfied in this environment"
+        "p2p.py cannot be imported here (${P2P_ERROR})"
 fi
 
 # 4c — registration against a real NIXL agent, both preconditions
@@ -282,7 +333,11 @@ else:
 fi
 
 # 4d — DRAM registration arguments and returned source metadata (no torch/NIXL needed)
-run_py "4d" "register_cpu_memory_nixl registers DRAM regions and returns source metadata" '
+if [ -n "${UTILS_ERROR}" ]; then
+    record_skip "4d" "register_cpu_memory_nixl registers DRAM regions and returns source metadata" \
+        "p2p_transfer_utils.py cannot be imported here (${UTILS_ERROR})"
+else
+    run_py "4d" "register_cpu_memory_nixl registers DRAM regions and returns source metadata" '
 from unittest.mock import MagicMock
 
 agent = MagicMock()
@@ -302,6 +357,7 @@ else:
 agent.register_memory.assert_not_called()
 print("OK: DRAM regions registered with device_id 0 and pinned memory enforced")
 '
+fi
 
 # 4e — structural check: one-time registration branches on the backend
 run_py_raw "4e" "_pause_and_prepare_engines branches on transfer_backend" '

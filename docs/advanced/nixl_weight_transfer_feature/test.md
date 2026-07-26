@@ -323,9 +323,10 @@ validation now; keep `run.py --mode nixl --check-weight-update-equal` for Step 5
 
 ## Step 4 — CPU DRAM memory registration
 
-`run_tests_step_4.sh` runs every Step 4 test. It stubs missing third-party deps (torch, ray,
-mooncake, sglang, megatron, …) so the registration logic is exercised outside the container, and
-skips — never fakes — the tests that need real NIXL:
+`run_tests_step_4.sh` runs every Step 4 test. In the container it imports everything for real; on a
+machine without the heavy deps (torch, ray, mooncake, sglang, megatron, …) it stubs a dependency only
+after its absence has actually broken the import under test, so the registration logic is still
+exercised. It skips — never fakes — the tests that need real NIXL:
 
 ```bash
 ./docs/advanced/nixl_weight_transfer_feature/run_tests_step_4.sh
