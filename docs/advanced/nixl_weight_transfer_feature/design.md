@@ -115,9 +115,9 @@ new agent object and a new write sequence but fits entirely within this existing
 | S2 | CPU replica, conversion, and target grouping | `_create_cpu_replica()` creates shared pinned buffers; conversion and `_transfer_engine_meta_list` group work by target rank | Same; only the remote identity in each metadata entry differs | Miles rank |
 | B3 | Source memory registration | `register_cpu_memory()` registers the shared pinned buffers with the transfer engine | `register_cpu_memory_nixl()` registers `(addr, size, 0, "")` DRAM regions with the agent | Miles rank, once on first prepare |
 | S3 | Staging and scheduling | Stage shards, call `load_weights()`, synchronously protect reusable replicas, and submit the final replica's writes in the background | Same | Miles rank |
-| B4a | Per-tensor source descriptors | Registered `(addr, numel, element_size)` tuple | `(addr, size, 0)` tuple passed to `get_xfer_descs` | Miles rank |
-| B4b | Per-tensor destination descriptors | Remote `(addr, numel, element_size)` from `RemoteWeightInfo` | Remote `(addr, size, device_id)` derived from the four-field weight metadata | Miles rank |
-| B4c | Transfer call | `batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)` | `get_xfer_descs` → `initialize_xfer("WRITE", …)` → `transfer()` → poll `check_xfer_state()` | Miles rank |
+| B4a | Source descriptors | Registered `(addr, numel, element_size)` tuple per tensor | `(addr, size, 0)` tuples for the whole batch, passed to `get_xfer_descs` as `"DRAM"` | Miles rank |
+| B4b | Destination descriptors | Remote `(addr, numel, element_size)` from `RemoteWeightInfo` | Remote `(addr, size, device_id)` from the four-field weight metadata, as `"VRAM"` | Miles rank |
+| B4c | Transfer call | one `batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)` per session | one `get_xfer_descs` per side → `initialize_xfer("WRITE", …)` → `transfer()` → poll `check_xfer_state()` → `release_xfer_handle()` per session | Miles rank |
 | S4 | Completion barrier | `_gather_and_update_expert_weights()` calls `wait_transfers()` | Same | Miles rank |
 | S5 | Engine finalization | Update the weight version and resume with `post_load_weights=True` | Same | Miles / SGLang lifecycle |
 
@@ -166,9 +166,12 @@ Per touch point, the smallest change that makes NIXL work. Nothing is duplicated
 
 ### 4.5 NIXL WRITE transfer loop (branch in the write path)
 
-- Branch `_do_p2p_write_one_session()`: if `backend == "nixl"`, run the NIXL transfer sequence per
-  parameter; otherwise keep the existing Mooncake `batch_transfer_sync_write()` call.
-- No Mooncake code is modified; the two paths are fully independent.
+- Branch `_do_p2p_write_one_session()`: if `backend == "nixl"`, run the NIXL transfer sequence once for
+  the session's whole batch of parameters; otherwise keep the existing Mooncake
+  `batch_transfer_sync_write()` call.
+- The shared prologue gains a `device_id` collection guarded by the same backend check, so only the
+  NIXL path reads that field; the Mooncake call itself is untouched and the two paths are otherwise
+  fully independent.
 
 ## 5. The metadata schema Miles consumes
 

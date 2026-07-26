@@ -114,11 +114,16 @@ results live in `test.md`.
 
 **Files:** `miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py`
 
-- Branch `_do_p2p_write_one_session()` on the remote target's backend:
-  - `"nixl"` → for each parameter, derive `(addr, size, 0)` source descriptors from the one-time
-    CPU registration and `(addr, size, device_id)` destination descriptors from
-    `RemoteWeightInfo`; run `get_xfer_descs` → `initialize_xfer("WRITE", …)` → `transfer()` and poll
-    `check_xfer_state()` until `"DONE"` or raise on `"ERR"`.
+- Branch `_do_p2p_write_one_session()` on the remote target's backend, after the shared prologue that
+  builds `source_ptrs`, `source_lens`, and `target_ptrs`. The prologue also collects
+  `target_device_ids`, but only when the target's backend is NIXL: the `device_id` field exists solely
+  in the NIXL weight entries, so the Mooncake path never reads it.
+  - `"nixl"` → one transfer per session, the parallel of Mooncake's one batched call: `(addr, size, 0)`
+    source descriptors from the one-time CPU registration as `"DRAM"`, `(addr, size, device_id)`
+    destination descriptors from `RemoteWeightInfo` as `"VRAM"`, then
+    `get_xfer_descs` → `initialize_xfer("WRITE", …)` → `transfer()` and poll `check_xfer_state()`
+    until `"DONE"` or raise on `"ERR"`. Release the transfer handle in a `finally`, so a failed
+    transfer cannot leak handles across weight-update iterations.
   - `"mooncake"` → keep the existing `batch_transfer_sync_write()` call unchanged.
 - Keep staging, `load_weights()`, synchronous protection of reusable replicas, background
   scheduling of the final replica, MoE handling, and `wait_transfers()` shared.
@@ -129,5 +134,10 @@ results live in `test.md`.
 - **5b** — `check_xfer_state` returning `"ERR"` raises `RuntimeError` (mock, no GPU).
 - **5c** — a transfer failure does not discard or repeat the one-time CPU memory registration
   (mock, no GPU).
-- **5d** — Mooncake write path is not modified and passes its existing tests (regression).
+- **5d** — Mooncake write path still issues the identical `batch_transfer_sync_write()` call, still
+  accepts three-field weight entries, and never touches the NIXL agent (regression).
 - **5e** — small-model E2E: `--check-weight-update-equal` passes with `--mode nixl` (requires GPU + NIXL + SGLang).
+- **5f** — descriptor contents: sizes are `numel * element_size`, sources are `"DRAM"` on device 0,
+  targets are `"VRAM"` on SGLang's `device_id`, and the whole batch is one transfer (mock, no GPU).
+- **5g** — the write path branches on the remote backend, keeps the Mooncake call, and registers
+  nothing.

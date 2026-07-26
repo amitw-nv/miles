@@ -481,6 +481,18 @@ print('OK: registration branches on backend and stays out of the write path')
 
 ## Step 5 — Branch the existing P2P WRITE
 
+`run_tests_step_5.sh` runs every Step 5 test. The mock-based ones need no GPU, NIXL or SGLang; the
+E2E (5e) is opt-in because it needs GPUs and a prepared checkpoint:
+
+```bash
+./docs/advanced/nixl_weight_transfer_feature/run_tests_step_5.sh
+RUN_E2E=1 E2E_MODEL=GLM-Z1-9B-0414 ./docs/advanced/nixl_weight_transfer_feature/run_tests_step_5.sh
+```
+
+All parameters of one session travel in a **single** NIXL transfer, mirroring Mooncake's one
+`batch_transfer_sync_write` call per session: `get_xfer_descs` receives the whole batch as one
+descriptor list per side, so there is one `initialize_xfer`, one `transfer`, and one poll loop.
+
 ### Test 5a — NIXL write path calls the 3-step API in the correct order (unit, no GPU)
 
 ```bash
@@ -595,23 +607,58 @@ print('OK: transfer failure leaves one-time registration intact')
 
 ### Test 5d — Mooncake write path unchanged (regression, no GPU)
 
-Run the existing Mooncake weight-transfer unit tests. All must pass without modification.
+The repository has no Mooncake write-path unit tests to re-run (the only P2P coverage is the 8-GPU
+`tests/e2e/megatron/test_qwen3_4B_p2p.py`, which is disabled in CI), so the regression is pinned
+directly instead:
 
-- **Checks:** the NIXL branch additions in `p2p.py` do not affect the `backend == "mooncake"` code path.
-- **Expected:** existing Mooncake test suite exits 0.
+```bash
+python -c "
+from unittest.mock import MagicMock
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import p2p as p2p_mod
+
+engine = MagicMock()
+engine.batch_transfer_sync_write.return_value = 0
+agent = MagicMock()
+
+obj = object.__new__(p2p_mod.UpdateWeightP2P)
+obj._transfer_engine = engine
+obj._nixl_agent = agent
+obj._weight_memory_registry = {'layer.weight': (0xCAFE0000, 64, 2)}
+
+# three-field weight entries, and the dataclass default backend='mooncake'
+remote = p2p_mod.RemoteWeightInfo(
+    session_id='10.0.0.7:18000',
+    weights_info={'layer.weight': (0xDEAD0000, 64, 2)},
+)
+obj._do_p2p_write_one_session(remote, ['layer.weight'])
+
+engine.batch_transfer_sync_write.assert_called_once_with(
+    '10.0.0.7:18000', [0xCAFE0000], [0xDEAD0000], [128]
+)
+assert not agent.method_calls
+print('OK: Mooncake write path unchanged')
+"
+```
+
+- **Checks:** the Mooncake branch still issues exactly the same
+  `batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)` call, three-field
+  weight entries still parse now that the write path also reads a `device_id`, no NIXL method is
+  touched, and a negative return code still raises `RuntimeError` naming the session.
+- **Expected:** prints `OK: Mooncake write path unchanged`.
 
 ### Test 5e — small-model E2E with NIXL (e2e, needs GPU + NIXL + SGLang)
 
 ```bash
 python -c "import nixl; print('nixl importable')"   # gate first
-python examples/p2p_weight_transfer/run.py run Qwen/Qwen2-0.5B \
-    --mode nixl \
-    --check-weight-update-equal \
-    --num-weight-updates 2
+python examples/p2p_weight_transfer/run.py run GLM-Z1-9B-0414 --mode nixl
 ```
 
+`run.py` appends `--check-weight-update-equal` itself (unless `SKIP_VALIDATION=1`), so no extra
+validation flag is needed. The model must be a name `run.py list` knows, prepared beforehand with
+`run.py prepare <MODEL>`.
+
 - **Checks:** Miles launches the real SGLang NIXL seed; its connection phase passes mandatory Test
-  2d by parsing live tagged metadata and constructing real `ServerArgs`; both weight-update
+  2d by parsing live tagged metadata and constructing real `ServerArgs`; the weight-update
   iterations complete, `--check-weight-update-equal` reports no mismatches, and no NIXL `ERR` state
   is logged.
 - **Expected:** clean exit with a summary showing all parameter checks passed.
@@ -619,6 +666,80 @@ python examples/p2p_weight_transfer/run.py run Qwen/Qwen2-0.5B \
   - `AssertionError` from `--check-weight-update-equal` → weight data corrupted during transfer; check descriptor sizes and `device_id` values.
   - `RuntimeError: NIXL transfer failed` → `check_xfer_state` returned `"ERR"`; check IB/UCX link.
   - Hang in `check_xfer_state` poll → transfer never completed; set a timeout and inspect NIXL logs.
+
+### Test 5f — descriptor contents and one transfer per batch (unit, no GPU, no NIXL)
+
+```bash
+python -c "
+from unittest.mock import MagicMock, call
+from miles.backends.megatron_utils.update_weight.update_weight_from_distributed import p2p as p2p_mod
+
+agent = MagicMock()
+agent.check_xfer_state.return_value = 'DONE'
+
+obj = object.__new__(p2p_mod.UpdateWeightP2P)
+obj._nixl_agent = agent
+obj._weight_memory_registry = {'a': (0x1000, 4, 4), 'b': (0x2000, 8, 2)}
+
+remote = p2p_mod.RemoteWeightInfo(
+    session_id='sglang_worker_0',
+    weights_info={'a': (0xA000, 4, 4, 3), 'b': (0xB000, 8, 2, 3)},
+    agent_name='sglang_worker_0',
+    backend='nixl',
+)
+obj._do_p2p_write_one_session(remote, ['a', 'b'])
+
+assert agent.get_xfer_descs.call_args_list == [
+    call([(0x1000, 16, 0), (0x2000, 16, 0)], 'DRAM'),
+    call([(0xA000, 16, 3), (0xB000, 16, 3)], 'VRAM'),
+]
+operation, _src, _dst, remote_agent = agent.initialize_xfer.call_args.args
+assert operation == 'WRITE' and remote_agent == 'sglang_worker_0'
+assert agent.initialize_xfer.call_count == 1
+agent.transfer.assert_called_once_with(agent.initialize_xfer.return_value)
+agent.release_xfer_handle.assert_called_once_with(agent.initialize_xfer.return_value)
+print('OK: descriptors correct and the batch travels in one transfer')
+"
+```
+
+- **Checks:** each descriptor size is `numel * element_size`, sources are `"DRAM"` on `device_id` 0,
+  targets are `"VRAM"` on the `device_id` SGLang published, the whole batch goes out as one
+  `initialize_xfer`/`transfer` pair (parallel to Mooncake's single `batch_transfer_sync_write`), and
+  the transfer handle is released so repeated updates cannot leak handles.
+- **Expected:** prints `OK: descriptors correct and the batch travels in one transfer`.
+
+### Test 5g — write path branches on the remote backend (static, no GPU)
+
+```bash
+python -c "
+import ast
+from pathlib import Path
+
+tree = ast.parse(Path(
+    'miles/backends/megatron_utils/update_weight/'
+    'update_weight_from_distributed/p2p.py'
+).read_text())
+cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'UpdateWeightP2P')
+write = next(
+    n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_do_p2p_write_one_session'
+)
+write_dump = ast.dump(write)
+assert 'batch_transfer_sync_write' in write_dump
+assert 'backend' in write_dump
+assert 'register_memory' not in write_dump and 'register_cpu_memory' not in write_dump
+
+class_calls = {
+    n.func.attr for n in ast.walk(cls) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+}
+assert {'get_xfer_descs', 'initialize_xfer', 'transfer', 'check_xfer_state'} <= class_calls
+print('OK: write path branches on backend, both backends intact')
+"
+```
+
+- **Checks:** the Mooncake call still lives in `_do_p2p_write_one_session`, the method branches on the
+  remote target's `backend`, the NIXL transfer sequence exists in the class, and no registration call
+  leaked into the per-update write path.
+- **Expected:** prints `OK: write path branches on backend, both backends intact`.
 
 ---
 
@@ -645,8 +766,11 @@ python examples/p2p_weight_transfer/run.py run Qwen/Qwen2-0.5B \
 | 5a | 5 | unit | no | no (mocked) | 3-step API called in order |
 | 5b | 5 | unit | no | no (mocked) | `"ERR"` raises `RuntimeError` |
 | 5c | 5 | unit | no | no (mocked) | failure leaves registration intact |
-| 5d | 5 | unit | no | no | Mooncake suite passes unchanged |
-| 5e | 5 | e2e | yes | yes | `--check-weight-update-equal` passes |
+| 5d | 5 | unit | no | no (mocked) | same `batch_transfer_sync_write` call, NIXL agent untouched |
+| 5e | 5 | e2e (opt-in) | yes | yes | `--check-weight-update-equal` passes |
+| 5f | 5 | unit | no | no (mocked) | DRAM/VRAM descriptors, one transfer per batch, handle released |
+| 5g | 5 | static | no | no | write branches on backend, both paths intact |
 
 No-GPU tests are listed as individual commands above. Tests 3a and 4c require NIXL but no GPU;
-tests 2d, 3c, and 5e require a container with GPUs and NIXL/UCX installed.
+tests 2d, 3c, and 5e require a container with GPUs and NIXL/UCX installed. 5e is opt-in in its
+runner (`RUN_E2E=1`) because it also needs a prepared checkpoint.

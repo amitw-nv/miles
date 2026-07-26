@@ -404,15 +404,67 @@ class UpdateWeightP2P(DistBucketedWeightUpdateMixin):
 
         session_id = remote_session.session_id
         target_ptrs = []
+        target_device_ids = []
         for name in valid_names:
             if name in remote_session.weights_info:
-                target_ptrs.append(remote_session.weights_info[name][0])
+                target_info = remote_session.weights_info[name]
+                target_ptrs.append(target_info[0])
+                if remote_session.backend == "nixl":
+                    # Only NIXL weight entries carry a device_id, needed for its destination descriptor.
+                    target_device_ids.append(target_info[3])
 
         assert len(target_ptrs) == len(source_ptrs), (
             f"[P2P-Shared] Pointer count mismatch for session {session_id}, "
             f"source: {len(source_ptrs)}, target: {len(target_ptrs)}"
         )
 
+        if remote_session.backend == "nixl":
+            self._do_nixl_write(remote_session, source_ptrs, source_lens, target_ptrs, target_device_ids)
+            return
+
         ret = self._transfer_engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
         if ret < 0:
             raise RuntimeError(f"[P2P-Shared] Transfer failed for session {session_id}, error: {ret}")
+
+    def _do_nixl_write(
+        self,
+        remote_session: RemoteWeightInfo,
+        source_ptrs: list[int],
+        source_lens: list[int],
+        target_ptrs: list[int],
+        target_device_ids: list[int],
+    ) -> None:
+        """NIXL RDMA WRITE of one batch of parameters, the parallel of ``batch_transfer_sync_write``.
+
+        Sources are the pinned CPU buffers registered once on this rank (DRAM, ``device_id`` 0);
+        targets are SGLang's GPU buffers described by ``RemoteWeightInfo`` (VRAM, per-parameter
+        ``device_id``). The remote descriptors are resolved through the agent metadata exchanged by
+        ``add_nixl_remote_agent()`` during connection, so nothing is registered here.
+        """
+        agent_name = remote_session.agent_name
+        source_descs = self._nixl_agent.get_xfer_descs(
+            [(addr, size, 0) for addr, size in zip(source_ptrs, source_lens, strict=True)], "DRAM"
+        )
+        target_descs = self._nixl_agent.get_xfer_descs(
+            [
+                (addr, size, device_id)
+                for addr, size, device_id in zip(target_ptrs, source_lens, target_device_ids, strict=True)
+            ],
+            "VRAM",
+        )
+
+        handle = self._nixl_agent.initialize_xfer("WRITE", source_descs, target_descs, agent_name)
+        if handle is None:
+            raise RuntimeError(f"[P2P-Shared] NIXL failed to initialize the WRITE to agent {agent_name}")
+
+        try:
+            state = self._nixl_agent.transfer(handle)
+            while state != "DONE":
+                if state == "ERR":
+                    raise RuntimeError(
+                        f"[P2P-Shared] NIXL transfer failed for agent {agent_name}, "
+                        f"parameters: {len(source_ptrs)}"
+                    )
+                state = self._nixl_agent.check_xfer_state(handle)
+        finally:
+            self._nixl_agent.release_xfer_handle(handle)
