@@ -92,12 +92,27 @@ export MODEL=Kimi-K2-Instruct
 export HF_REPO=moonshotai/Kimi-K2-Instruct
 export MODEL_TYPE=kimi-k2
 
-# Nodes taking part in the HF -> torch_dist conversion, per
-# docs/models/kimi/kimi-k2.md § 3.3. Ranks 0..CONVERT_NODES-1 run it as one
-# torchrun job; the rest wait for the tracker file. No parallel-size arguments
-# are passed — the doc's command is MODEL_ARGS only, and adding to it is what
-# broke the earlier single-node attempt.
+# HF -> torch_dist conversion. Ranks 0..CONVERT_NODES-1 run it as one torchrun
+# job; the rest wait for the tracker file.
+#
+# The parallel sizes mirror docs/models/deepseek/deepseek.md, which
+# docs/models/kimi/kimi-k2.md tells you to follow ("mirror the DeepSeek-V3
+# procedure"). The Kimi page's own snippet omits them, and without them the
+# converter shards nothing: every rank builds the whole trillion-parameter model
+# and dies with CUDA OOM at 79 GiB.
+#
+# Two constraints tie these numbers together:
+#   ETP * EP * PP must equal the GPU count, 8 * CONVERT_NODES = 32
+#     1 * 4 * 8 = 32. Megatron rejects any other product outright.
+#   The pipeline split must cover all 61 layers
+#     7 stages of 8 + a last stage of 5 = 61, hence DECODER_LAST=5.
+# Change one and you must re-derive the rest.
 export CONVERT_NODES=4
+export CONVERT_TP=1
+export CONVERT_ETP=1
+export CONVERT_PP=8
+export CONVERT_EP=4
+export CONVERT_DECODER_LAST=5
 
 export MILES_FORK=https://github.com/amitw-nv/miles.git
 export MILES_BRANCH=amitw/miles-nixl
@@ -187,6 +202,11 @@ set -ex
 RANK="${SLURM_NODEID:-0}"
 TRACKER=/root/multinode/${MODEL}_torch_dist/latest_checkpointed_iteration.txt
 DOWNLOAD_DONE=/root/models/.${MODEL}.download_complete
+MODEL_DIR=/root/models/$MODEL
+export MODEL_DIR
+# Barrier for the conversion ranks. Lives in the per-job log directory, so it is
+# always absent at job start and can never be a leftover from an earlier run.
+PREP_DONE=/root/logs/prep_done
 
 # ---- Step 1: Update Miles ---------------------------------------------------
 echo "--- [rank $RANK] Updating Miles ($MILES_BRANCH) ---"
@@ -241,7 +261,6 @@ if [ "$RANK" -eq 0 ]; then
     # ~1 TB. Keyed on its own sentinel, not on the converted checkpoint, so a
     # failed conversion does not drag the download check back in. hf download
     # resumes, so a rerun only fetches what is missing.
-    MODEL_DIR=/root/models/$MODEL
     if [ -f "$DOWNLOAD_DONE" ]; then
         echo "--- Model already downloaded, skipping ---"
     else
@@ -251,6 +270,32 @@ if [ "$RANK" -eq 0 ]; then
         du -sh "$MODEL_DIR"
         touch "$DOWNLOAD_DONE"
     fi
+
+    # ---- Step 6b: Point the checkpoint at the DeepSeek-V3 loader ------------
+    # mbridge has no kimi_k2 entry — it fails with "Unregistered model type:
+    # kimi_k2, now only support dict_keys([...])". This is the `sed` that
+    # docs/models/kimi/kimi-k2.md alludes to in its architecture note: Kimi-K2
+    # is DeepSeek-V3-shaped, and the HF config already declares
+    # DeepseekV3ForCausalLM as its architecture, so only model_type is in the
+    # way. Idempotent, and it leaves a .orig behind the first time.
+    python3 - <<'PY'
+import json, os, shutil
+cfg = os.path.join(os.environ["MODEL_DIR"], "config.json")
+with open(cfg) as f:
+    conf = json.load(f)
+if conf.get("model_type") == "deepseek_v3":
+    print(f"--- config.json already patched (model_type=deepseek_v3) ---")
+else:
+    print(f"--- Patching config.json: model_type {conf.get('model_type')!r} -> 'deepseek_v3' ---")
+    shutil.copy2(cfg, cfg + ".orig")
+    conf["model_type"] = "deepseek_v3"
+    with open(cfg, "w") as f:
+        json.dump(conf, f, indent=2, ensure_ascii=False)
+print("architectures:", conf.get("architectures"))
+PY
+
+    # Ranks 1..3 may now start: the model is on disk and its config is patched.
+    touch "$PREP_DONE"
 fi
 
 # ---- Step 7: Convert checkpoint (skip if already done) ----------------------
@@ -262,10 +307,11 @@ fi
 # any weights: "world_size (8) is not divisible by
 # expert_tensor_model_pipeline_parallel size (64)".
 if [ "$RANK" -lt "$CONVERT_NODES" ]; then
-    # Ranks 1..3 join the conversion, so they wait for rank 0's download.
+    # Ranks 1..3 join the conversion, so they wait for rank 0 to finish
+    # downloading and patching the config.
     if [ "$RANK" -ne 0 ]; then
-        echo "--- [rank $RANK] Waiting for rank 0 to finish downloading ---"
-        while [ ! -f "$DOWNLOAD_DONE" ]; do
+        echo "--- [rank $RANK] Waiting for rank 0 to prepare the HF checkpoint ---"
+        while [ ! -f "$PREP_DONE" ]; do
             sleep 30
         done
     fi
@@ -283,6 +329,11 @@ if [ "$RANK" -lt "$CONVERT_NODES" ]; then
             --nnodes="$CONVERT_NODES" --node-rank "$RANK" \
             tools/convert_hf_to_torch_dist.py \
             "${MODEL_ARGS[@]}" \
+            --tensor-model-parallel-size "$CONVERT_TP" \
+            --pipeline-model-parallel-size "$CONVERT_PP" \
+            --expert-tensor-parallel-size "$CONVERT_ETP" \
+            --expert-model-parallel-size "$CONVERT_EP" \
+            --decoder-last-pipeline-num-layers "$CONVERT_DECODER_LAST" \
             --hf-checkpoint /root/models/$MODEL \
             --save /root/multinode/${MODEL}_torch_dist
     fi
