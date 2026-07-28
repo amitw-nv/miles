@@ -92,10 +92,12 @@ export MODEL=Kimi-K2-Instruct
 export HF_REPO=moonshotai/Kimi-K2-Instruct
 export MODEL_TYPE=kimi-k2
 
-# From PREPARE_CONFIGS["Kimi-K2-Instruct"] in examples/p2p_weight_transfer/run.py.
-# docs/models/kimi/kimi-k2.md describes a 4-node conversion instead; that is a
-# different parallelism layout, so these go with the 8-GPU single-node one.
-export CONVERT_EXTRA_ARGS="--expert-model-parallel-size 8 --decoder-last-pipeline-num-layers 5"
+# Nodes taking part in the HF -> torch_dist conversion, per
+# docs/models/kimi/kimi-k2.md § 3.3. Ranks 0..CONVERT_NODES-1 run it as one
+# torchrun job; the rest wait for the tracker file. No parallel-size arguments
+# are passed — the doc's command is MODEL_ARGS only, and adding to it is what
+# broke the earlier single-node attempt.
+export CONVERT_NODES=4
 
 export MILES_FORK=https://github.com/amitw-nv/miles.git
 export MILES_BRANCH=amitw/miles-nixl
@@ -184,6 +186,7 @@ set -ex
 
 RANK="${SLURM_NODEID:-0}"
 TRACKER=/root/multinode/${MODEL}_torch_dist/latest_checkpointed_iteration.txt
+DOWNLOAD_DONE=/root/models/.${MODEL}.download_complete
 
 # ---- Step 1: Update Miles ---------------------------------------------------
 echo "--- [rank $RANK] Updating Miles ($MILES_BRANCH) ---"
@@ -235,47 +238,65 @@ if [ "$RANK" -eq 0 ]; then
     ls -la "$EVAL_FILE"
 
     # ---- Step 6: Download model (skip if already present) -------------------
-    # ~1 TB. hf download resumes, so a rerun only fetches what is missing.
+    # ~1 TB. Keyed on its own sentinel, not on the converted checkpoint, so a
+    # failed conversion does not drag the download check back in. hf download
+    # resumes, so a rerun only fetches what is missing.
     MODEL_DIR=/root/models/$MODEL
-    if [ -f "$TRACKER" ]; then
-        echo "--- Checkpoint already converted, skipping model download ---"
+    if [ -f "$DOWNLOAD_DONE" ]; then
+        echo "--- Model already downloaded, skipping ---"
     else
         echo "--- Downloading model $HF_REPO ---"
         mkdir -p /root/models
         hf download "$HF_REPO" --local-dir "$MODEL_DIR"
         du -sh "$MODEL_DIR"
+        touch "$DOWNLOAD_DONE"
+    fi
+fi
+
+# ---- Step 7: Convert checkpoint (skip if already done) ----------------------
+# Exactly the command from docs/models/kimi/kimi-k2.md § 3.3: 4 nodes, and no
+# parallel-size arguments beyond MODEL_ARGS. An earlier version of this script
+# ran it on rank 0 alone with the extra --expert-model-parallel-size 8 and
+# --decoder-last-pipeline-num-layers 5 taken from PREPARE_CONFIGS in
+# examples/p2p_weight_transfer/run.py, and Megatron rejected it before loading
+# any weights: "world_size (8) is not divisible by
+# expert_tensor_model_pipeline_parallel size (64)".
+if [ "$RANK" -lt "$CONVERT_NODES" ]; then
+    # Ranks 1..3 join the conversion, so they wait for rank 0's download.
+    if [ "$RANK" -ne 0 ]; then
+        echo "--- [rank $RANK] Waiting for rank 0 to finish downloading ---"
+        while [ ! -f "$DOWNLOAD_DONE" ]; do
+            sleep 30
+        done
     fi
 
-    # ---- Step 7: Convert checkpoint (skip if already done) ------------------
     if [ -f "$TRACKER" ]; then
-        echo "--- Checkpoint already converted ($(cat $TRACKER)), skipping ---"
+        echo "--- [rank $RANK] Checkpoint already converted ($(cat $TRACKER)), skipping ---"
     else
-        echo "--- Converting HF checkpoint to Megatron format ---"
+        echo "--- [rank $RANK] Converting HF checkpoint across $CONVERT_NODES nodes ---"
         mkdir -p /root/multinode
         cd /root/miles
-        python3 -c "
-from miles.utils.external_utils.command_utils import convert_checkpoint
-convert_checkpoint(
-    model_name='$MODEL',
-    megatron_model_type='$MODEL_TYPE',
-    num_gpus_per_node=8,
-    multinode=False,
-    extra_args='$CONVERT_EXTRA_ARGS',
-    dir_dst='/root/multinode',
-)
-"
+        source scripts/models/$MODEL_TYPE.sh
+        PYTHONPATH=/root/Megatron-LM/ torchrun \
+            --nproc-per-node 8 \
+            --master-addr "$HEAD_NODE_IP" --master-port 12345 \
+            --nnodes="$CONVERT_NODES" --node-rank "$RANK" \
+            tools/convert_hf_to_torch_dist.py \
+            "${MODEL_ARGS[@]}" \
+            --hf-checkpoint /root/models/$MODEL \
+            --save /root/multinode/${MODEL}_torch_dist
     fi
-    echo "--- Checkpoint tracker: $(cat $TRACKER) ---"
-else
-    # ---- Steps 5-7 on workers: wait for rank 0 ------------------------------
-    # convert_checkpoint writes "release" into the tracker only once the
-    # conversion is complete, so it doubles as the ready signal.
-    echo "--- [rank $RANK] Waiting for rank 0 to prepare the checkpoint ---"
-    while [ ! -f "$TRACKER" ] || [ "$(tr -d '[:space:]' < "$TRACKER")" != "release" ]; do
-        sleep 30
-    done
-    echo "--- [rank $RANK] Checkpoint ready ---"
 fi
+
+# ---- All ranks: wait until the checkpoint is ready --------------------------
+# convert_hf_to_torch_dist.py writes "release" into the tracker as its very last
+# step, after a barrier, so it doubles as the ready signal for the 60 ranks that
+# took no part in the conversion.
+echo "--- [rank $RANK] Waiting for the converted checkpoint ---"
+while [ ! -f "$TRACKER" ] || [ "$(tr -d '[:space:]' < "$TRACKER")" != "release" ]; do
+    sleep 30
+done
+echo "--- [rank $RANK] Checkpoint ready: $(cat $TRACKER) ---"
 
 # ---- Step 8: Launch ---------------------------------------------------------
 # Kimi-K2-Instruct refuses to run with --check-weight-update-equal, so weight
