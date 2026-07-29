@@ -3,9 +3,19 @@
 # launch_kimi_k2_on_cluster.sh — 64-node (512-GPU) Kimi-K2 job on the cluster
 # =============================================================================
 #
-# Run prepare_kimi_k2_on_cluster.sh FIRST. This script assumes the model, the
-# datasets and the converted Megatron checkpoint are already on Lustre, and
-# refuses to queue for 64 nodes if any of them is missing.
+# THE THREE STEPS
+# ---------------
+#   1. cast_kimi_k2_to_bf16_on_cluster.sh   1 node    datasets, model, BF16 cast
+#   2. prepare_kimi_k2_on_cluster.sh        8 nodes   BF16 -> Megatron torch_dist
+#   3. launch_kimi_k2_on_cluster.sh        64 nodes   training
+#
+# Run steps 1 and 2 FIRST. This script assumes the model, the datasets and the
+# converted Megatron checkpoint are already on Lustre, and refuses to queue for
+# 64 nodes if any of them is missing.
+#
+# Note that --hf-checkpoint here is the original FP8 download, not the BF16 copy
+# step 1 produced. Only the conversion needed BF16; SGLang reads the FP8
+# checkpoint, which is why step 1 leaves it untouched.
 #
 # WHAT IT DOES
 # ------------
@@ -45,7 +55,8 @@
 #
 # RESETTING
 # ---------
-# To rebuild the model or the checkpoint, see prepare_kimi_k2_on_cluster.sh.
+# To rebuild the model or the BF16 copy see cast_kimi_k2_to_bf16_on_cluster.sh;
+# to rebuild the Megatron checkpoint see prepare_kimi_k2_on_cluster.sh.
 # To rebuild the container image, delete and re-import the sqsh:
 #   rm -f <LUSTRE>/radixark+miles+latest.sqsh
 #   enroot import docker://radixark/miles:latest
@@ -124,10 +135,12 @@ if [ ! -f "$SQSH" ]; then
          "enroot import docker://radixark/miles:latest"
 fi
 
+HERE=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+
 if [ ! -f "$HOST_MODELS/.${MODEL}.download_complete" ]; then
     fail "$MODEL has not been downloaded (sentinel missing under $HOST_MODELS)" \
-         "Run the prepare job first:" \
-         "bash $(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/prepare_kimi_k2_on_cluster.sh"
+         "Run step 1 first:" \
+         "bash $HERE/cast_kimi_k2_to_bf16_on_cluster.sh"
 fi
 
 TRACKER=$HOST_CKPT/${MODEL}_torch_dist/latest_checkpointed_iteration.txt
@@ -135,15 +148,15 @@ if [ ! -f "$TRACKER" ] || [ "$(tr -d '[:space:]' < "$TRACKER")" != "release" ]; 
     fail "no completed Megatron checkpoint at $HOST_CKPT/${MODEL}_torch_dist" \
          "convert_hf_to_torch_dist.py writes 'release' into the tracker as its" \
          "last action, so anything else means the conversion did not finish." \
-         "Run the prepare job first:" \
-         "bash $(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/prepare_kimi_k2_on_cluster.sh"
+         "Run step 2 first:" \
+         "bash $HERE/prepare_kimi_k2_on_cluster.sh"
 fi
 
 for ds in dapo-math-17k/dapo-math-17k.jsonl aime-2024/aime-2024.jsonl; do
     if [ ! -f "$HOST_DATASETS/$ds" ]; then
         fail "dataset file missing: $HOST_DATASETS/$ds" \
-             "Run the prepare job first:" \
-             "bash $(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/prepare_kimi_k2_on_cluster.sh"
+             "Run step 1 first:" \
+             "bash $HERE/cast_kimi_k2_to_bf16_on_cluster.sh"
     fi
 done
 
