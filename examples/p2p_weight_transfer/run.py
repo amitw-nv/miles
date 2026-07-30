@@ -409,10 +409,13 @@ RUN_CONFIGS: dict[str, RunConfig] = {
     "Qwen3-30B-A3B": RunConfig(
         model_type="qwen3-30B-A3B",
         nnodes=4,
-        num_train_gpus=16,
-        num_rollout_gpus=16,
-        tp=4,
+        num_train_gpus=8,  # DP = 8 / (tp * pp * cp) = 1
+        num_rollout_gpus=24,  # 6 engines
+        tp=8,
+        pp=1,
+        cp=1,
         ep=8,
+        etp=1,  # experts not tensor-sharded
         advantage_estimator="gspo",
         eps_clip="4e-4",
         eps_clip_high=None,
@@ -421,9 +424,9 @@ RUN_CONFIGS: dict[str, RunConfig] = {
         optimizer_cpu_offload=True,
         enable_nccl_nvls=True,
         rotary_base=1000000,
-        sglang_gpus_per_engine=8,
+        sglang_gpus_per_engine=4,  # SGLang TP = 4
         sglang_mem_fraction=0.8,
-        sglang_ep_size=8,
+        sglang_ep_size=4,
         sglang_cuda_graph_bs="1 2 4 8 16",
         sglang_enable_dp_attention=True,
         sglang_enable_dp_lm_head=True,
