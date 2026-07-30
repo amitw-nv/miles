@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# launch_on_cluster.sh — Run a Miles P2P weight transfer job on the cluster
+# launch_on_cluster_1node.sh — Run a 1-node Miles P2P weight transfer job on the cluster
 # =============================================================================
 #
 # PREREQUISITES

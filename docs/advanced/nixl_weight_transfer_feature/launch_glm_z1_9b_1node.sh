@@ -15,7 +15,7 @@
 #
 # HOW THIS SCRIPT WORKS
 # ---------------------
-# Same as launch_on_cluster.sh, plus steps 5-7 which are run automatically
+# Same as launch_on_cluster_1node.sh, plus steps 5-7 which are run automatically
 # inside the container on every launch (idempotent — skipped if already done):
 #   5. Download dataset  dapo-math-17k
 #   6. Download model    GLM-Z1-9B-0414
@@ -77,7 +77,7 @@ echo ""
 
 # --- Command to run inside the container -------------------------------------
 #
-# Steps 1-4 are identical to launch_on_cluster.sh.
+# Steps 1-4 are identical to launch_on_cluster_1node.sh.
 # Steps 5-7 are the model-specific setup added here.
 #
 INNER_CMD=$(cat <<'EOF'
