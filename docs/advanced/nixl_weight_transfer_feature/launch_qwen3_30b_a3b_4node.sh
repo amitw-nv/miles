@@ -54,7 +54,7 @@ PORTFOLIO=network_research_advdev
 PARTITION=batch
 
 MILES_FORK=https://github.com/amitw-nv/miles.git
-MILES_BRANCH=amitw/miles-nixl
+MILES_BRANCH=amitw/miles-nixl-experiments
 
 SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl

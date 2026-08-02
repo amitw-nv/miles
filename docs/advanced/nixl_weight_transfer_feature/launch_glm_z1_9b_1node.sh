@@ -42,7 +42,7 @@ set -e
 PORTFOLIO=network_research_advdev
 
 MILES_FORK=https://github.com/amitw-nv/miles.git
-MILES_BRANCH=amitw/miles-nixl
+MILES_BRANCH=amitw/miles-nixl-experiments
 
 SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl
@@ -84,11 +84,11 @@ INNER_CMD=$(cat <<'EOF'
 set -ex
 
 # ---- Step 1: Update Miles ---------------------------------------------------
-echo "--- Updating Miles (amitw/miles-nixl) ---"
+echo "--- Updating Miles (amitw/miles-nixl-experiments) ---"
 git -C /root/miles remote add fork https://github.com/amitw-nv/miles.git 2>/dev/null || true
 git -C /root/miles restore . 2>/dev/null || git -C /root/miles checkout . 2>/dev/null || true
-git -C /root/miles fetch fork amitw/miles-nixl
-git -C /root/miles checkout -B amitw/miles-nixl fork/amitw/miles-nixl
+git -C /root/miles fetch fork amitw/miles-nixl-experiments
+git -C /root/miles checkout -B amitw/miles-nixl-experiments fork/amitw/miles-nixl-experiments
 
 # ---- Step 2: Update SGLang --------------------------------------------------
 echo "--- Updating SGLang (amitw/sgl-miles-nixl) ---"

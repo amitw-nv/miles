@@ -24,7 +24,7 @@
 #      The sqsh is only used on first run; subsequent runs reuse the saved state.
 #
 # 2. Inside the container, updates Miles and SGLang to your fork branches:
-#    - Miles:  github.com/amitw-nv/miles  branch amitw/miles-nixl
+#    - Miles:  github.com/amitw-nv/miles  branch amitw/miles-nixl-experiments
 #    - SGLang: github.com/amitw-nv/sglang branch amitw/sgl-miles-nixl
 #    Both are installed as editable (pip install -e .), so git checkout alone
 #    is enough to activate code changes — no reinstall needed.
@@ -55,7 +55,7 @@ set -e
 PORTFOLIO=network_research_advdev
 
 MILES_FORK=https://github.com/amitw-nv/miles.git
-MILES_BRANCH=amitw/miles-nixl
+MILES_BRANCH=amitw/miles-nixl-experiments
 
 SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl
