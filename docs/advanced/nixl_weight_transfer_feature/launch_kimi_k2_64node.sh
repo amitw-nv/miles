@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# launch_kimi_k2_64node.sh — end-to-end Kimi-K2: download → convert → train
+# launch_kimi_k2_64node.sh — end-to-end Kimi-K2: convert → train
 # =============================================================================
 #
 # PREREQUISITES
@@ -13,22 +13,28 @@
 #   cd /lustre/fsw/portfolios/network/users/amitw/miles/
 #   enroot import docker://radixark/miles:latest
 #
+# The Kimi-K2 weights must already be on Lustre under $HOST_MODELS below. This
+# script never downloads the model; it fails fast if the weights are absent.
+# Both on-disk layouts are accepted:
+#   $HOST_MODELS/Kimi-K2-Instruct                      (hf download --local-dir)
+#   $HOST_MODELS/models--moonshotai--Kimi-K2-Instruct  (HF hub cache)
+#
 # END-TO-END FLOW
 # ---------------
 # Run this script once from the login node. It checks which steps are already
 # done and submits only the jobs that are still needed, chaining each with
 # --dependency=afterok so they run in sequence automatically:
 #
-#   [download job]  — submitted if HF checkpoint or datasets are missing
-#       1 node, 1 GPU. Downloads moonshotai/Kimi-K2-Instruct to Lustre and
-#       both datasets. All data lands on the shared Lustre filesystem so no
-#       local node storage is consumed beyond the container image.
+#   [dataset job]   — submitted if either dataset is missing
+#       1 node, 1 GPU. Downloads dapo-math-17k and aime-2024 to Lustre. The
+#       model itself is never downloaded — see PREREQUISITES.
 #       Time limit: 4 h.
 #
 #   [convert job]   — submitted if the Megatron torch_dist checkpoint is missing
 #       8 nodes, 64 GPUs (PP=8, EP=8 → 32 GB of BF16 weights per GPU).
 #       Phase a — node 0 only: detects FP8 weights and casts to BF16 if needed
-#         (output: $LUSTRE/models/Kimi-K2-Instruct-bf16).
+#         (output: $HOST_MODELS/Kimi-K2-Instruct-bf16, next to the original
+#         weights — that directory must be writable).
 #         All other nodes wait via a Lustre flag file.
 #       Phase b — all 8 nodes: multi-node torchrun converts the BF16 checkpoint
 #         to Megatron torch_dist format
@@ -107,8 +113,9 @@ C_NAME=amitw-miles-nohome-64node
 LOG_DIR=$LUSTRE/logs
 
 # Bind-mounted at the container paths run.py hardcodes, so these three are not
-# free to rename.
-HOST_MODELS=$LUSTRE/models
+# free to rename. HOST_MODELS is the pre-populated weights directory — it sits
+# outside $LUSTRE because it is shared across models (GLM, Qwen, Kimi).
+HOST_MODELS=/lustre/fsw/portfolios/network/users/amitw/models
 HOST_CKPT=$LUSTRE/multinode
 HOST_DATASETS=$LUSTRE/datasets
 
@@ -131,16 +138,68 @@ if [ ! -f "$SQSH" ]; then
          "enroot import docker://radixark/miles:latest"
 fi
 
-# --- Determine which preparation steps are needed ----------------------------
-NEEDS_DOWNLOAD=0
-NEEDS_CONVERT=0
+# --- Locate the pre-downloaded HF checkpoint ---------------------------------
+#
+# run.py hardcodes /root/models/$MODEL, and $MODEL has to stay the registry key
+# "Kimi-K2-Instruct" because that is what RUN_CONFIGS is keyed on. When the
+# weights are stored in HF hub cache layout the two names differ, so bridge
+# them with a symlink. The whole models directory is mounted as one tree, so
+# the snapshot's relative ../../blobs/<sha> symlinks still resolve.
+[ -d "$HOST_MODELS" ] || fail "models directory not found at $HOST_MODELS" \
+    "Set HOST_MODELS to the directory holding the Kimi-K2 weights."
 
-# hf download writes the shard index last; its presence means download finished.
-if [ ! -f "$HOST_MODELS/$MODEL/model.safetensors.index.json" ]; then
-    echo "HF checkpoint missing — will submit download job."
-    NEEDS_DOWNLOAD=1
-    NEEDS_CONVERT=1
+HF_DIR=$HOST_MODELS/$MODEL
+
+if [ ! -f "$HF_DIR/config.json" ]; then
+    if [ -d "$HF_DIR" ] && [ ! -L "$HF_DIR" ]; then
+        fail "$HF_DIR exists but has no config.json" \
+             "Remove the incomplete directory or point HOST_MODELS elsewhere."
+    fi
+
+    CACHE_NAME=models--moonshotai--$MODEL
+    CACHE_DIR=$HOST_MODELS/$CACHE_NAME
+    [ -d "$CACHE_DIR" ] || fail "Kimi-K2 weights not found under $HOST_MODELS" \
+        "Expected one of:" \
+        "  $HOST_MODELS/$MODEL" \
+        "  $CACHE_DIR" \
+        "This script does not download the model."
+
+    # refs/main names the current revision; fall back to scanning snapshots for
+    # caches created without a ref (e.g. a revision-pinned download).
+    SNAPSHOT=""
+    if [ -f "$CACHE_DIR/refs/main" ]; then
+        REV=$(tr -d '[:space:]' < "$CACHE_DIR/refs/main")
+        if [ -f "$CACHE_DIR/snapshots/$REV/config.json" ]; then
+            SNAPSHOT=snapshots/$REV
+        fi
+    fi
+    if [ -z "$SNAPSHOT" ]; then
+        for d in "$CACHE_DIR"/snapshots/*; do
+            if [ -f "$d/config.json" ]; then
+                SNAPSHOT=snapshots/$(basename "$d")
+                break
+            fi
+        done
+    fi
+    [ -n "$SNAPSHOT" ] || fail "no usable snapshot in $CACHE_DIR" \
+        "None of the snapshots/* directories contains a config.json."
+
+    # Relative on purpose: the link is dereferenced inside the container, where
+    # this directory lives at /root/models and the host path does not exist.
+    echo "Linking $HF_DIR -> $CACHE_NAME/$SNAPSHOT"
+    ln -sfn "$CACHE_NAME/$SNAPSHOT" "$HF_DIR"
 fi
+
+# hf writes the shard index last; its absence means the download never finished.
+[ -f "$HF_DIR/model.safetensors.index.json" ] || \
+    fail "$HF_DIR has no model.safetensors.index.json" \
+         "The checkpoint looks incomplete — re-download it before launching."
+
+echo "Using HF checkpoint: $(readlink -f "$HF_DIR")"
+
+# --- Determine which preparation steps are needed ----------------------------
+NEEDS_DATASETS=0
+NEEDS_CONVERT=0
 
 # convert_hf_to_torch_dist.py writes 'release' into the tracker as its last
 # action, so anything else means the conversion did not finish.
@@ -153,59 +212,58 @@ fi
 # run.py passes both files by absolute path, so these names are fixed.
 for ds in dapo-math-17k/dapo-math-17k.jsonl aime-2024/aime-2024.jsonl; do
     if [ ! -f "$HOST_DATASETS/$ds" ]; then
-        echo "Dataset missing: $ds — will submit download job."
-        NEEDS_DOWNLOAD=1
+        echo "Dataset missing: $ds — will submit dataset job."
+        NEEDS_DATASETS=1
     fi
 done
 
 mkdir -p "$LOG_DIR"
 PREV_JOB_ID=""
 
-# --- Submit download job if needed -------------------------------------------
-if [ "$NEEDS_DOWNLOAD" -eq 1 ]; then
-    DL_JOB_SCRIPT=$LOG_DIR/job-kimi-k2-download.slurm
-    cat > "$DL_JOB_SCRIPT" <<DL_SLURM
+# --- Submit dataset job if needed --------------------------------------------
+if [ "$NEEDS_DATASETS" -eq 1 ]; then
+    DS_JOB_SCRIPT=$LOG_DIR/job-kimi-k2-datasets.slurm
+    cat > "$DS_JOB_SCRIPT" <<DS_SLURM
 #!/bin/bash
-#SBATCH --job-name=miles-kimi-k2-download
+#SBATCH --job-name=miles-kimi-k2-datasets
 #SBATCH --partition=$PARTITION
 #SBATCH --account=$PORTFOLIO
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
 #SBATCH --time=04:00:00
-#SBATCH --output=$LOG_DIR/miles-kimi-k2-download-%j.out
+#SBATCH --output=$LOG_DIR/miles-kimi-k2-datasets-%j.out
 
 srun \\
     --container-image="$SQSH" \\
     --no-container-mount-home \\
-    --container-name="${C_NAME}-download" \\
-    --container-mounts="$HOST_MODELS:/root/models,$HOST_DATASETS:/root/datasets" \\
+    --container-name="${C_NAME}-datasets" \\
+    --container-mounts="$HOST_DATASETS:/root/datasets" \\
     bash -lc '
 set -ex
 
-echo "--- [Download] Downloading HF checkpoint: moonshotai/$MODEL ---"
-hf download moonshotai/$MODEL --local-dir /root/models/$MODEL
-
-echo "--- [Download] Downloading dataset: dapo-math-17k ---"
+echo "--- [Datasets] Downloading dataset: dapo-math-17k ---"
 hf download --repo-type dataset zhuzilin/dapo-math-17k --local-dir /root/datasets/dapo-math-17k
 
-echo "--- [Download] Downloading dataset: aime-2024 ---"
+echo "--- [Datasets] Downloading dataset: aime-2024 ---"
 hf download --repo-type dataset zhuzilin/aime-2024 --local-dir /root/datasets/aime-2024
 
-echo "--- [Download] Done ---"
+echo "--- [Datasets] Done ---"
 '
-DL_SLURM
+DS_SLURM
 
-    DL_JOB_ID=$(sbatch --parsable "$DL_JOB_SCRIPT")
-    echo "Submitted download job $DL_JOB_ID"
-    echo "  tail -f $LOG_DIR/miles-kimi-k2-download-${DL_JOB_ID}.out"
-    PREV_JOB_ID=$DL_JOB_ID
+    DS_JOB_ID=$(sbatch --parsable "$DS_JOB_SCRIPT")
+    echo "Submitted dataset job $DS_JOB_ID"
+    echo "  tail -f $LOG_DIR/miles-kimi-k2-datasets-${DS_JOB_ID}.out"
+    PREV_JOB_ID=$DS_JOB_ID
 fi
 
 # --- Submit convert job if needed --------------------------------------------
 if [ "$NEEDS_CONVERT" -eq 1 ]; then
     CONV_DEP=""
-    [ -n "$PREV_JOB_ID" ] && CONV_DEP="--dependency=afterok:$PREV_JOB_ID"
+    if [ -n "$PREV_JOB_ID" ]; then
+        CONV_DEP="--dependency=afterok:$PREV_JOB_ID"
+    fi
 
     CONV_JOB_SCRIPT=$LOG_DIR/job-kimi-k2-convert.slurm
     cat > "$CONV_JOB_SCRIPT" <<CONV_SLURM
@@ -292,7 +350,9 @@ fi
 
 # --- Print launch info -------------------------------------------------------
 MAIN_DEP=""
-[ -n "$PREV_JOB_ID" ] && MAIN_DEP="--dependency=afterok:$PREV_JOB_ID"
+if [ -n "$PREV_JOB_ID" ]; then
+    MAIN_DEP="--dependency=afterok:$PREV_JOB_ID"
+fi
 
 echo ""
 echo "=========================================="
@@ -306,10 +366,12 @@ echo "  Nodes     : $NUM_NODES"
 echo "  Miles     : $MILES_BRANCH"
 echo "  SGLang    : $SGLANG_BRANCH"
 echo "  Container : $C_NAME (from $SQSH)"
-echo "  Model dir : $HOST_MODELS/$MODEL"
+echo "  Model dir : $(readlink -f "$HF_DIR")"
 echo "  Ckpt dir  : $HOST_CKPT/${MODEL}_torch_dist"
 echo "  Logs      : $LOG_DIR"
-[ -n "$PREV_JOB_ID" ] && echo "  Waiting on: prep job $PREV_JOB_ID"
+if [ -n "$PREV_JOB_ID" ]; then
+    echo "  Waiting on: prep job $PREV_JOB_ID"
+fi
 echo "=========================================="
 echo ""
 
