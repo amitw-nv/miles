@@ -220,7 +220,21 @@ PREPARE_CONFIGS: dict[str, PrepareConfig] = {
         hf_repo="moonshotai/Kimi-K2-Instruct",
         model_type="kimi-k2",
         datasets=["zhuzilin/dapo-math-17k", "zhuzilin/aime-2024"],
-        convert_extra_args="--expert-model-parallel-size 8 --decoder-last-pipeline-num-layers 5",
+        # ~1T params is ~2 TB in bf16, so the convert cannot fit on one node's
+        # 640 GB of HBM. docs/models/kimi/kimi-k2.md uses 4 nodes, but 32 GPUs
+        # is a floor of 64 GB each and lands at 68 GB of an 80 GB H100; 8 nodes
+        # give PP 8 x DP 8 with EP 8 on the DP dimension, or 34 GB per GPU.
+        # PP must be explicit: left at 1, convert_hf_to_torch_dist.py sizes it to
+        # the world size, giving PP 16 / EP 1 and no dimension left for EP.
+        convert_multinode=True,
+        convert_num_nodes=8,
+        convert_extra_args=(
+            "--pipeline-model-parallel-size 8 "
+            "--expert-model-parallel-size 8 "
+            "--tensor-model-parallel-size 1 "
+            "--expert-tensor-parallel-size 1 "
+            "--decoder-last-pipeline-num-layers 5"
+        ),
     ),
 }
 
