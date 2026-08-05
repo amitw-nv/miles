@@ -13,6 +13,14 @@
 #   cd /lustre/fsw/portfolios/network/users/amitw/miles/
 #   enroot import docker://radixark/miles:latest
 #
+# Code reaches the nodes via Lustre, not GitHub. The login node fetches miles
+# and sglang into bare mirrors under $LUSTRE/src, and every container fetches
+# from a read-only bind-mount of those. This is not an optimisation: eight
+# compute nodes fetching github.com at once tripped GitHub's abuse throttle,
+# which git surfaces as "could not read Username for 'https://github.com'"
+# followed by exit 128, and the main job would make 128 such requests. The
+# login node therefore needs GitHub access; the compute nodes need none.
+#
 # The HF weights are already staged at:
 #   /lustre/fsw/portfolios/network/users/amitw/models/new-download-kimi-k2
 # That directory is bind-mounted onto /root/models/Kimi-K2-Instruct because
@@ -64,8 +72,8 @@
 # with random weights and only the transferred weights are real.
 #
 # Mount safety (Megatron):
-#   Bind-mount ONLY the leaf dirs that run.py hardcodes
-#   (/root/models/Kimi-K2-Instruct, /root/multinode, /root/datasets, /root/signals).
+#   Bind-mount ONLY leaf dirs (/root/models/Kimi-K2-Instruct, /root/multinode,
+#   /root/datasets, /root/signals, /root/src/*.git).
 #   Do NOT mount over /root or home — that shadows /root/miles and
 #   /root/Megatron-LM and breaks the Megatron import. Always keep
 #   --no-container-mount-home on the srun.
@@ -133,6 +141,10 @@ HOST_MODEL_DIR=$HOST_MODELS/new-download-kimi-k2
 HOST_CKPT=$LUSTRE/multinode
 HOST_DATASETS=$LUSTRE/datasets
 
+# Bare mirrors the jobs fetch from instead of GitHub. See the staging step below.
+MILES_SRC=$LUSTRE/src/miles.git
+SGLANG_SRC=$LUSTRE/src/sglang.git
+
 # --- Validate sqsh exists ----------------------------------------------------
 if [ ! -f "$SQSH" ]; then
     echo ""
@@ -148,7 +160,31 @@ fi
 
 # pyxis will not create mount sources, so every bind-mount source has to exist
 # before the srun or container setup fails before any of our code runs.
-mkdir -p "$LOG_DIR" "$HOST_MODEL_DIR" "$HOST_CKPT" "$HOST_DATASETS"
+mkdir -p "$LOG_DIR" "$HOST_MODEL_DIR" "$HOST_CKPT" "$HOST_DATASETS" "$LUSTRE/src"
+
+# --- Stage the code on Lustre ------------------------------------------------
+# One fetch here, from the login node, instead of one per compute node. Eight
+# simultaneous anonymous fetches already tripped GitHub's abuse throttle: git
+# gets handed a 401 and reports it as "could not read Username", then exits 128.
+# The main job would make 128 of them at once. Reading a bare repo off Lustre
+# costs the same at 64 nodes as at 1, and pinning the jobs to the SHA resolved
+# here means all 64 run identical code even if the branch moves mid-run.
+stage_repo() {
+    local bare=$1 url=$2 branch=$3
+    [ -d "$bare" ] || git init --bare -q "$bare"
+    if ! git -C "$bare" fetch --force --quiet "$url" "+$branch:$branch"; then
+        echo "" >&2
+        echo "ERROR: could not fetch $branch from $url on this node." >&2
+        echo "The mirror at $bare is what every compute node reads from." >&2
+        echo "" >&2
+        return 1
+    fi
+}
+
+stage_repo "$MILES_SRC" "$MILES_FORK" "$MILES_BRANCH"
+stage_repo "$SGLANG_SRC" "$SGLANG_FORK" "$SGLANG_BRANCH"
+MILES_SHA=$(git -C "$MILES_SRC" rev-parse "$MILES_BRANCH")
+SGLANG_SHA=$(git -C "$SGLANG_SRC" rev-parse "$SGLANG_BRANCH")
 
 # --- Determine whether preparation is needed ---------------------------------
 NEEDS_PREPARE=0
@@ -203,15 +239,17 @@ srun \\
     --container-image="$SQSH" \\
     --no-container-mount-home \\
     --container-name="${C_NAME}-prepare" \\
-    --container-mounts="$HOST_MODEL_DIR:/root/models/$MODEL,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets,\$PREP_SIGNALS:/root/signals" \\
+    --container-mounts="$HOST_MODEL_DIR:/root/models/$MODEL,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets,$MILES_SRC:/root/src/miles.git:ro,\$PREP_SIGNALS:/root/signals" \\
     bash -lc '
 set -ex
 
-echo "--- [Prepare node \${SLURM_NODEID}] Updating Miles ($MILES_BRANCH) ---"
-git -C /root/miles remote add fork $MILES_FORK 2>/dev/null || true
+# Fetch from the Lustre mirror, not GitHub — see the staging step in the
+# launcher. Checking out the SHA rather than the branch pins every node to the
+# commit the login node resolved.
+echo "--- [Prepare node \${SLURM_NODEID}] Updating Miles ($MILES_BRANCH @ ${MILES_SHA:0:9}) ---"
 git -C /root/miles restore . 2>/dev/null || git -C /root/miles checkout . 2>/dev/null || true
-git -C /root/miles fetch fork $MILES_BRANCH
-git -C /root/miles checkout -B $MILES_BRANCH fork/$MILES_BRANCH
+git -C /root/miles fetch /root/src/miles.git $MILES_BRANCH
+git -C /root/miles checkout -B $MILES_BRANCH $MILES_SHA
 pip install -q "numpy<2" "scipy<1.15"
 
 NODE_RANK=\${SLURM_NODEID}
@@ -305,8 +343,8 @@ echo "  Partition : $PARTITION"
 echo "  Model     : $MODEL"
 echo "  Mode      : $MODE"
 echo "  Nodes     : $NUM_NODES"
-echo "  Miles     : $MILES_BRANCH"
-echo "  SGLang    : $SGLANG_BRANCH"
+echo "  Miles     : $MILES_BRANCH @ ${MILES_SHA:0:9} (from $MILES_SRC)"
+echo "  SGLang    : $SGLANG_BRANCH @ ${SGLANG_SHA:0:9} (from $SGLANG_SRC)"
 echo "  Container : $C_NAME (from $SQSH)"
 echo "  Model dir : $HOST_MODEL_DIR"
 echo "  Ckpt dir  : $HOST_CKPT/${MODEL}_torch_dist"
@@ -348,23 +386,24 @@ srun --mpi=pmix \\
     --container-image="$SQSH" \\
     --no-container-mount-home \\
     --container-name="$C_NAME" \\
-    --container-mounts="$HOST_MODEL_DIR:/root/models/$MODEL,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets,\$HOST_SIGNALS:/root/signals" \\
+    --container-mounts="$HOST_MODEL_DIR:/root/models/$MODEL,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets,$MILES_SRC:/root/src/miles.git:ro,$SGLANG_SRC:/root/src/sglang.git:ro,\$HOST_SIGNALS:/root/signals" \\
     bash -lc '
 set -ex
 
 # ---- Step 1: Update Miles ---------------------------------------------------
-echo "--- [Node \${SLURM_NODEID}] Updating Miles ($MILES_BRANCH) ---"
-git -C /root/miles remote add fork $MILES_FORK 2>/dev/null || true
+# Fetch from the Lustre mirror, not GitHub — see the staging step in the
+# launcher. Checking out the SHA rather than the branch pins all 64 nodes to
+# the commit the login node resolved.
+echo "--- [Node \${SLURM_NODEID}] Updating Miles ($MILES_BRANCH @ ${MILES_SHA:0:9}) ---"
 git -C /root/miles restore . 2>/dev/null || git -C /root/miles checkout . 2>/dev/null || true
-git -C /root/miles fetch fork $MILES_BRANCH
-git -C /root/miles checkout -B $MILES_BRANCH fork/$MILES_BRANCH
+git -C /root/miles fetch /root/src/miles.git $MILES_BRANCH
+git -C /root/miles checkout -B $MILES_BRANCH $MILES_SHA
 
 # ---- Step 2: Update SGLang --------------------------------------------------
-echo "--- [Node \${SLURM_NODEID}] Updating SGLang ($SGLANG_BRANCH) ---"
-git -C /sgl-workspace/sglang remote add fork $SGLANG_FORK 2>/dev/null || true
+echo "--- [Node \${SLURM_NODEID}] Updating SGLang ($SGLANG_BRANCH @ ${SGLANG_SHA:0:9}) ---"
 git -C /sgl-workspace/sglang restore . 2>/dev/null || git -C /sgl-workspace/sglang checkout . 2>/dev/null || true
-git -C /sgl-workspace/sglang fetch fork $SGLANG_BRANCH
-git -C /sgl-workspace/sglang checkout -B $SGLANG_BRANCH fork/$SGLANG_BRANCH
+git -C /sgl-workspace/sglang fetch /root/src/sglang.git $SGLANG_BRANCH
+git -C /sgl-workspace/sglang checkout -B $SGLANG_BRANCH $SGLANG_SHA
 
 # ---- Step 3: Fix numpy and scipy versions -----------------------------------
 echo "--- [Node \${SLURM_NODEID}] Fixing numpy and scipy versions ---"
