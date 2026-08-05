@@ -335,7 +335,8 @@ HF_CKPT=\$(cat \$FLAG)
 
 echo "--- [Convert Node \$SLURM_NODEID] Converting \$HF_CKPT to torch_dist ---"
 cd /root/miles
-torchrun --nnodes=$CONV_NODES --nproc_per_node=8 --node-rank=\$SLURM_NODEID --rdzv_id=\$SLURM_JOB_ID --rdzv_backend=c10d --rdzv_endpoint=\$MASTER_ADDR:29500 tools/convert_hf_to_torch_dist.py --hf-checkpoint \$HF_CKPT --save /root/multinode/${MODEL}_torch_dist --num-layers 61 --pipeline-model-parallel-size 8 --expert-model-parallel-size 8 --decoder-last-pipeline-num-layers 5
+source scripts/models/kimi-k2.sh
+torchrun --nnodes=$CONV_NODES --nproc_per_node=8 --node-rank=\$SLURM_NODEID --rdzv_id=\$SLURM_JOB_ID --rdzv_backend=c10d --rdzv_endpoint=\$MASTER_ADDR:29500 tools/convert_hf_to_torch_dist.py "\${MODEL_ARGS[@]}" --hf-checkpoint \$HF_CKPT --save /root/multinode/${MODEL}_torch_dist --num-layers 61 --pipeline-model-parallel-size 8 --expert-model-parallel-size 8 --decoder-last-pipeline-num-layers 5
 
 if [ \$SLURM_NODEID -eq 0 ]; then rm -f \$FLAG; fi
 echo "--- [Convert Node \$SLURM_NODEID] Done ---"
