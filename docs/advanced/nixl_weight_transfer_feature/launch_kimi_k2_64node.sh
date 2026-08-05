@@ -288,8 +288,8 @@ set -ex
 echo "--- [Convert Node \$SLURM_NODEID] Updating Miles ($MILES_BRANCH) ---"
 git -C /root/miles remote add fork $MILES_FORK 2>/dev/null || true
 git -C /root/miles restore . 2>/dev/null || git -C /root/miles checkout . 2>/dev/null || true
-git -C /root/miles fetch fork $MILES_BRANCH
-git -C /root/miles checkout -B $MILES_BRANCH fork/$MILES_BRANCH
+git -C /root/miles fetch fork $MILES_BRANCH || true
+git -C /root/miles checkout -B $MILES_BRANCH fork/$MILES_BRANCH || true
 pip install -q "numpy<2" "scipy<1.15"
 
 MASTER_ADDR=\$(python3 -c "
