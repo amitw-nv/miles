@@ -338,6 +338,10 @@ echo "--- [Node \$NODE_RANK] Head IP: \$HEAD_NODE_IP ---"
 # Megatron checkpoint exists on the shared /root/multinode mount.
 echo "--- [Node \$NODE_RANK] Starting $MODEL (mode=$MODE) ---"
 export MILES_LOG_DIR=/root/signals
+# Qwen3-235B-A22B-Instruct-2507 has rope_theta=5000000; the model script
+# defaults to 1000000 (an older Qwen3 value). Must be exported before run.py
+# so the env var is inherited when the model script is sourced inside run.py.
+export MODEL_ARGS_ROTARY_BASE=5000000
 cd /root/miles
 bash examples/p2p_weight_transfer/Qwen3-235B-A22B.sh $MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
 
