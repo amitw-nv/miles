@@ -87,10 +87,10 @@ PORTFOLIO=network_research_advdev
 PARTITION=batch
 NUM_NODES=16
 
-MILES_FORK=https://github.com/amitw-nv/miles.git
+MILES_FORK=git@github.com:amitw-nv/miles.git
 MILES_BRANCH=amitw/miles-nixl-experiments
 
-SGLANG_FORK=https://github.com/amitw-nv/sglang.git
+SGLANG_FORK=git@github.com:amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl
 
 LUSTRE=/lustre/fsw/portfolios/network/users/amitw/miles
