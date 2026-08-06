@@ -13,6 +13,13 @@
 #   cd /lustre/fsw/portfolios/network/users/amitw/miles/
 #   enroot import docker://radixark/miles:latest
 #
+# CODE STAGING (no GitHub access from compute nodes)
+# --------------------------------------------------
+# Compute nodes cannot reach GitHub. This script fetches Miles and SGLang
+# from GitHub once on the login node into bare mirrors on Lustre, then
+# every compute node fetches from those mirrors instead. The login node
+# needs GitHub access; the compute nodes need none.
+#
 # END-TO-END FLOW
 # ---------------
 # Run this script once from the login node. It checks what is already staged on
@@ -23,7 +30,7 @@
 #       torch_dist checkpoint are missing.
 #       1 node, 8 GPUs. Runs `run.py prepare Qwen3-235B-A22B-Instruct-2507`, which
 #       downloads Qwen/Qwen3-235B-A22B-Instruct-2507 plus both datasets and converts
-#       the checkpoint to torch_dist (single-node torchrun, 4 GPUs). Writes onto
+#       the checkpoint to torch_dist (single-node torchrun, 8 GPUs). Writes onto
 #       Lustre via bind-mounts. Time limit: 4 h.
 #
 #   [main job]     — always submitted, waits for the prepare job if there is one.
@@ -99,6 +106,10 @@ HOST_MODELS=/lustre/fsw/portfolios/network/users/amitw/models
 HOST_CKPT=$LUSTRE/multinode
 HOST_DATASETS=$LUSTRE/datasets
 
+# Bare mirrors fetched here on the login node; compute nodes read from Lustre.
+MILES_SRC=$LUSTRE/src/miles.git
+SGLANG_SRC=$LUSTRE/src/sglang.git
+
 # --- Validate sqsh exists ----------------------------------------------------
 if [ ! -f "$SQSH" ]; then
     echo ""
@@ -114,7 +125,29 @@ fi
 
 # pyxis will not create mount sources, so every bind-mount source has to exist
 # before the srun or container setup fails before any of our code runs.
-mkdir -p "$LOG_DIR" "$HOST_MODELS" "$HOST_CKPT" "$HOST_DATASETS"
+mkdir -p "$LOG_DIR" "$HOST_MODELS" "$HOST_CKPT" "$HOST_DATASETS" "$LUSTRE/src"
+
+# --- Stage code on Lustre (login node fetches from GitHub once) --------------
+stage_repo() {
+    local bare=$1 url=$2 branch=$3
+    [ -d "$bare" ] || git init --bare -q "$bare"
+    if ! git -C "$bare" fetch --force --quiet "$url" "+$branch:$branch"; then
+        echo "" >&2
+        echo "ERROR: could not fetch $branch from $url" >&2
+        echo "Make sure this login node has GitHub access." >&2
+        echo "" >&2
+        return 1
+    fi
+}
+
+stage_repo "$MILES_SRC"  "$MILES_FORK"  "$MILES_BRANCH"
+stage_repo "$SGLANG_SRC" "$SGLANG_FORK" "$SGLANG_BRANCH"
+
+MILES_SHA=$(git -C "$MILES_SRC" rev-parse "$MILES_BRANCH")
+SGLANG_SHA=$(git -C "$SGLANG_SRC" rev-parse "$SGLANG_BRANCH")
+
+echo "Miles  : $MILES_BRANCH @ ${MILES_SHA:0:9}"
+echo "SGLang : $SGLANG_BRANCH @ ${SGLANG_SHA:0:9}"
 
 # --- Determine whether preparation is needed ---------------------------------
 NEEDS_PREPARE=0
@@ -162,15 +195,15 @@ srun \\
     --container-image="$SQSH" \\
     --no-container-mount-home \\
     --container-name="${C_NAME}-prepare" \\
-    --container-mounts="$HOST_MODELS:/root/models,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets" \\
+    --container-mounts="$HOST_MODELS:/root/models,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets,$MILES_SRC:/root/src/miles.git:ro" \\
     bash -lc '
 set -ex
 
-echo "--- [Prepare] Updating Miles ($MILES_BRANCH) ---"
-git -C /root/miles remote add fork $MILES_FORK 2>/dev/null || true
+# Fetch from the Lustre mirror — login node already pulled from GitHub.
+echo "--- [Prepare] Updating Miles ($MILES_BRANCH @ ${MILES_SHA:0:9}) ---"
 git -C /root/miles restore . 2>/dev/null || git -C /root/miles checkout . 2>/dev/null || true
-git -C /root/miles fetch fork $MILES_BRANCH || echo "Warning: GitHub unreachable, using container Miles"
-git -C /root/miles checkout -B $MILES_BRANCH fork/$MILES_BRANCH || true
+git -C /root/miles fetch /root/src/miles.git $MILES_BRANCH
+git -C /root/miles checkout -B $MILES_BRANCH $MILES_SHA
 pip install -q "numpy<2" "scipy<1.15"
 
 # Downloads the HF checkpoint and both datasets, then converts to torch_dist.
@@ -203,8 +236,8 @@ echo "  Partition : $PARTITION"
 echo "  Model     : $MODEL"
 echo "  Mode      : $MODE"
 echo "  Nodes     : $NUM_NODES"
-echo "  Miles     : $MILES_BRANCH"
-echo "  SGLang    : $SGLANG_BRANCH"
+echo "  Miles     : $MILES_BRANCH @ ${MILES_SHA:0:9}"
+echo "  SGLang    : $SGLANG_BRANCH @ ${SGLANG_SHA:0:9}"
 echo "  Container : $C_NAME (from $SQSH)"
 echo "  Model dir : $HOST_MODELS/$MODEL"
 echo "  Ckpt dir  : $HOST_CKPT/${MODEL}_torch_dist"
@@ -234,7 +267,7 @@ cat > "$JOB_SCRIPT" <<SLURM
 mkdir -p $LOG_DIR
 
 # Per-job signal directory. run.py has rank 0 write job_done_<mode> here when
-# training ends and the 3 workers poll for it, so it has to be a shared mount —
+# training ends and the workers poll for it, so it has to be a shared mount —
 # run.py's default is container-local and the workers would never see it.
 # Keying it on the job id stops a leftover signal from an earlier run from
 # making every worker exit immediately. pyxis will not create mount sources.
@@ -246,23 +279,21 @@ srun --mpi=pmix \\
     --container-image="$SQSH" \\
     --no-container-mount-home \\
     --container-name="$C_NAME" \\
-    --container-mounts="$HOST_MODELS:/root/models,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets,\$HOST_SIGNALS:/root/signals" \\
+    --container-mounts="$HOST_MODELS:/root/models,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets,\$HOST_SIGNALS:/root/signals,$MILES_SRC:/root/src/miles.git:ro,$SGLANG_SRC:/root/src/sglang.git:ro" \\
     bash -lc '
 set -ex
 
 # ---- Step 1: Update Miles ---------------------------------------------------
-echo "--- [Node \${SLURM_NODEID}] Updating Miles ($MILES_BRANCH) ---"
-git -C /root/miles remote add fork $MILES_FORK 2>/dev/null || true
+echo "--- [Node \${SLURM_NODEID}] Updating Miles ($MILES_BRANCH @ ${MILES_SHA:0:9}) ---"
 git -C /root/miles restore . 2>/dev/null || git -C /root/miles checkout . 2>/dev/null || true
-git -C /root/miles fetch fork $MILES_BRANCH
-git -C /root/miles checkout -B $MILES_BRANCH fork/$MILES_BRANCH
+git -C /root/miles fetch /root/src/miles.git $MILES_BRANCH
+git -C /root/miles checkout -B $MILES_BRANCH $MILES_SHA
 
 # ---- Step 2: Update SGLang --------------------------------------------------
-echo "--- [Node \${SLURM_NODEID}] Updating SGLang ($SGLANG_BRANCH) ---"
-git -C /sgl-workspace/sglang remote add fork $SGLANG_FORK 2>/dev/null || true
+echo "--- [Node \${SLURM_NODEID}] Updating SGLang ($SGLANG_BRANCH @ ${SGLANG_SHA:0:9}) ---"
 git -C /sgl-workspace/sglang restore . 2>/dev/null || git -C /sgl-workspace/sglang checkout . 2>/dev/null || true
-git -C /sgl-workspace/sglang fetch fork $SGLANG_BRANCH
-git -C /sgl-workspace/sglang checkout -B $SGLANG_BRANCH fork/$SGLANG_BRANCH
+git -C /sgl-workspace/sglang fetch /root/src/sglang.git $SGLANG_BRANCH
+git -C /sgl-workspace/sglang checkout -B $SGLANG_BRANCH $SGLANG_SHA
 
 # ---- Step 3: Fix numpy and scipy versions -----------------------------------
 echo "--- [Node \${SLURM_NODEID}] Fixing numpy and scipy versions ---"

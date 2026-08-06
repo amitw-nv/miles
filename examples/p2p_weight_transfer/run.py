@@ -213,7 +213,7 @@ PREPARE_CONFIGS: dict[str, PrepareConfig] = {
     "Qwen3-235B-A22B-Instruct-2507": PrepareConfig(
         hf_repo="Qwen/Qwen3-235B-A22B-Instruct-2507",
         model_type="qwen3-235B-A22B",
-        convert_gpus_per_node=4,
+        convert_gpus_per_node=8,
         datasets=["zhuzilin/dapo-math-17k", "zhuzilin/aime-2024"],
     ),
     "Kimi-K2-Instruct": PrepareConfig(
