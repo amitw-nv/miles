@@ -211,7 +211,7 @@ pip install -q "numpy<2" "scipy<1.15"
 # idempotent, so a re-run resumes rather than redoes.
 echo "--- [Prepare] Downloading and converting $MODEL ---"
 cd /root/miles
-python3 examples/p2p_weight_transfer/run.py prepare $MODEL
+python3 examples/infra_features/p2p_weight_transfer/run.py prepare $MODEL
 
 echo "--- [Prepare] Done ---"
 '
@@ -343,7 +343,7 @@ export MILES_LOG_DIR=/root/signals
 # so the env var is inherited when the model script is sourced inside run.py.
 export MODEL_ARGS_ROTARY_BASE=5000000
 cd /root/miles
-bash examples/p2p_weight_transfer/Qwen3-235B-A22B.sh $MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
+bash examples/infra_features/p2p_weight_transfer/Qwen3-235B-A22B.sh $MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
 
 '
 SLURM

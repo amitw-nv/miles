@@ -154,7 +154,7 @@ echo "--- Checkpoint tracker: $(cat $TRACKER) ---"
 # ---- Step 8: Ready — drop into interactive shell ----------------------------
 echo ""
 echo "--- Setup complete. You are now inside the container. ---"
-echo "--- Run your model, e.g.: bash examples/p2p_weight_transfer/GLM-Z1-9B.sh p2p ---"
+echo "--- Run your model, e.g.: bash examples/infra_features/p2p_weight_transfer/GLM-Z1-9B.sh p2p ---"
 cd /root/miles
 exec /bin/bash
 EOF

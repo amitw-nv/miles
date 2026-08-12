@@ -178,7 +178,7 @@ pip install -q "numpy<2" "scipy<1.15"
 # idempotent, so a re-run resumes rather than redoes.
 echo "--- [Prepare] Downloading and converting $MODEL ---"
 cd /root/miles
-python3 examples/p2p_weight_transfer/run.py prepare $MODEL
+python3 examples/infra_features/p2p_weight_transfer/run.py prepare $MODEL
 
 echo "--- [Prepare] Done ---"
 '
@@ -308,7 +308,7 @@ echo "--- [Node \$NODE_RANK] Head IP: \$HEAD_NODE_IP ---"
 echo "--- [Node \$NODE_RANK] Starting $MODEL (mode=$MODE) ---"
 export MILES_LOG_DIR=/root/signals
 cd /root/miles
-bash examples/p2p_weight_transfer/$MODEL.sh $MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
+bash examples/infra_features/p2p_weight_transfer/$MODEL.sh $MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
 
 '
 SLURM
