@@ -187,7 +187,7 @@ if [ "$NEEDS_PREPARE" -eq 1 ]; then
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=$LOG_DIR/miles-qwen3-235b-a22b-prepare-%j.out
 
 # Mount ONLY leaf dirs — never /root or home (breaks Megatron imports).
@@ -261,7 +261,7 @@ cat > "$JOB_SCRIPT" <<SLURM
 #SBATCH --nodes=$NUM_NODES
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=$LOG_DIR/%x-%j.out
 
 mkdir -p $LOG_DIR
