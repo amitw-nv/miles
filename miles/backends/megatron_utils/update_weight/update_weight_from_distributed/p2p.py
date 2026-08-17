@@ -296,21 +296,6 @@ class UpdateWeightP2P(DistBucketedWeightUpdateMixin):
 
         original_post_load_weights = model_loader_module.post_load_weights
         model_loader_module.post_load_weights = lambda *args, **kwargs: None
-
-        # Monkey-patch in_the_same_node_as to no-op BEFORE get_model, because
-        # LogitsProcessor.__init__ (via MultimemAllGatherer) probes real node
-        # topology when nnodes > 1. tp_group.cpu_group here belongs to the fake
-        # ParallelismContext built for this CPU-only shape replica, not a real
-        # process group, so the probe crashes with an uninitialized-group error.
-        # This is safe because this replica never runs a forward pass, so the
-        # gatherer's enabled/disabled state is irrelevant.
-        from sglang.srt.distributed import parallel_state as parallel_state_module
-
-        original_in_the_same_node_as = parallel_state_module.in_the_same_node_as
-        parallel_state_module.in_the_same_node_as = lambda pg, source_rank=0: [
-            True
-        ] * parallelism_config.world_size
-
         try:
             with ParallelismContext(parallelism_config):
                 model = get_model(
@@ -320,7 +305,6 @@ class UpdateWeightP2P(DistBucketedWeightUpdateMixin):
                 )
         finally:
             model_loader_module.post_load_weights = original_post_load_weights
-            parallel_state_module.in_the_same_node_as = original_in_the_same_node_as
 
         # Also patch the instance method for subsequent load_weights() calls
         # (deepseek_weight_loader.py:342 calls self.post_load_weights() at the end).
