@@ -85,6 +85,7 @@ MILES_BRANCH=amitw/miles-nixl-rebase
 
 SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl-rebase
+SGLANG_COMMIT=758128375755834094df3e58c134267468d17adb
 
 LUSTRE=/lustre/fsw/portfolios/network/users/amitw/miles
 SQSH=$LUSTRE/radixark+miles+latest+120826.sqsh
@@ -204,7 +205,7 @@ echo "  Model     : $MODEL"
 echo "  Mode      : $MODE"
 echo "  Nodes     : $NUM_NODES"
 echo "  Miles     : $MILES_BRANCH"
-echo "  SGLang    : $SGLANG_BRANCH"
+echo "  SGLang    : $SGLANG_BRANCH @ ${SGLANG_COMMIT:0:9}"
 echo "  Container : $C_NAME (from $SQSH)"
 echo "  Model dir : $HOST_MODELS/$MODEL"
 echo "  Ckpt dir  : $HOST_CKPT/${MODEL}_torch_dist"
@@ -258,11 +259,11 @@ git -C /root/miles fetch fork $MILES_BRANCH
 git -C /root/miles checkout -B $MILES_BRANCH fork/$MILES_BRANCH
 
 # ---- Step 2: Update SGLang --------------------------------------------------
-echo "--- [Node \${SLURM_NODEID}] Updating SGLang ($SGLANG_BRANCH) ---"
+echo "--- [Node \${SLURM_NODEID}] Updating SGLang ($SGLANG_BRANCH @ ${SGLANG_COMMIT:0:9}) ---"
 git -C /sgl-workspace/sglang remote add fork $SGLANG_FORK 2>/dev/null || true
 git -C /sgl-workspace/sglang restore . 2>/dev/null || git -C /sgl-workspace/sglang checkout . 2>/dev/null || true
 git -C /sgl-workspace/sglang fetch fork $SGLANG_BRANCH
-git -C /sgl-workspace/sglang checkout -B $SGLANG_BRANCH fork/$SGLANG_BRANCH
+git -C /sgl-workspace/sglang checkout -B $SGLANG_BRANCH $SGLANG_COMMIT
 
 # ---- Step 3: Fix numpy and scipy versions -----------------------------------
 echo "--- [Node \${SLURM_NODEID}] Fixing numpy and scipy versions ---"

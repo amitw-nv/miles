@@ -92,6 +92,7 @@ MILES_BRANCH=amitw/miles-nixl-rebase
 
 SGLANG_FORK=git@github.com:amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl-rebase
+SGLANG_COMMIT=758128375755834094df3e58c134267468d17adb
 
 LUSTRE=/lustre/fsw/portfolios/network/users/amitw/miles
 SQSH=$LUSTRE/radixark+miles+latest+120826.sqsh
@@ -144,7 +145,11 @@ stage_repo "$MILES_SRC"  "$MILES_FORK"  "$MILES_BRANCH"
 stage_repo "$SGLANG_SRC" "$SGLANG_FORK" "$SGLANG_BRANCH"
 
 MILES_SHA=$(git -C "$MILES_SRC" rev-parse "$MILES_BRANCH")
-SGLANG_SHA=$(git -C "$SGLANG_SRC" rev-parse "$SGLANG_BRANCH")
+
+# Pinned to a specific SGLang commit rather than the branch tip. The branch
+# fetch above pulls full history, so this commit is present in the mirror
+# as long as it is an ancestor of $SGLANG_BRANCH.
+SGLANG_SHA=$(git -C "$SGLANG_SRC" rev-parse --verify "${SGLANG_COMMIT}^{commit}")
 
 echo "Miles  : $MILES_BRANCH @ ${MILES_SHA:0:9}"
 echo "SGLang : $SGLANG_BRANCH @ ${SGLANG_SHA:0:9}"
