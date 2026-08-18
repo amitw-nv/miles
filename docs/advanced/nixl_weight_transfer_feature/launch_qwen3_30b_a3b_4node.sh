@@ -85,7 +85,7 @@ MILES_BRANCH=amitw/miles-nixl-rebase
 
 SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl-rebase
-SGLANG_COMMIT=758128375755834094df3e58c134267468d17adb
+SGLANG_COMMIT=cb05a44f35a7c9e27e46d74112cc841ca674ef43
 
 LUSTRE=/lustre/fsw/portfolios/network/users/amitw/miles
 SQSH=$LUSTRE/radixark+miles+latest+120826.sqsh
