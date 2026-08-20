@@ -91,7 +91,7 @@ MILES_FORK=git@github.com:amitw-nv/miles.git
 MILES_BRANCH=amitw/miles-nixl-final-rebase
 
 SGLANG_FORK=git@github.com:amitw-nv/sglang.git
-SGLANG_BRANCH=amitw/sgl-miles-nixl-rebase
+SGLANG_BRANCH=amitw/sgl-miles-nixl-upstream-pr
 
 LUSTRE=/lustre/fsw/portfolios/network/users/amitw/miles
 SQSH=$LUSTRE/radixark+miles+latest+120826.sqsh
