@@ -81,7 +81,7 @@ PARTITION=batch
 NUM_NODES=4
 
 MILES_FORK=https://github.com/amitw-nv/miles.git
-MILES_BRANCH=amitw/miles-nixl-final-rebase
+MILES_BRANCH=amitw/miles-nixl-upstream-pr
 
 SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl-upstream-pr
