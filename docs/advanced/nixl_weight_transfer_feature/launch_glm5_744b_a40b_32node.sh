@@ -26,14 +26,22 @@
 # Lustre and submits only the jobs that are still needed, chaining them with
 # --dependency=afterok so they run in sequence automatically:
 #
-#   [prepare job]  — submitted if the HF checkpoint, dapo-math-17k, or the
-#       Megatron torch_dist checkpoint are missing.
-#       16 nodes, 128 GPUs (PP=4 x EP=32). Rank 0 runs `run.py prepare GLM-5`
-#       (download + convert); the other ranks join Ray so convert can fan out.
-#       Time limit: 4 h.
+#   [download job] — submitted if the HF checkpoint or dapo-math-17k is missing.
+#       1 node on cpu_datamover, 0 GPUs. Rank 0 runs
+#       `run.py prepare GLM-5 --download-only`.
+#       Must not allocate GPUs: cw-dfw's Occupied Idle Job Reaper cancels
+#       batch jobs whose DCGM SM_ACTIVE stays <= 0.01 for 30 min (this is
+#       what killed 16434818 — 112/128 GPUs idle while rank 0 downloaded).
+#       cpu_datamover has no GPUs and no reaper. Time limit: 4 h.
 #
-#   [main job]     — always submitted, waits for the prepare job if there is one.
-#       32 nodes, 256 GPUs. The GLM-5 RLVR training run. Time limit: 4 h.
+#   [convert job]  — submitted if the Megatron torch_dist tracker is not
+#       `release`. 16 nodes, 128 GPUs (PP=4 x EP=32). Waits for the download
+#       job when there is one. Rank 0 runs `run.py prepare GLM-5` (HF/dataset
+#       steps no-op if already on Lustre); the other ranks join Ray so convert
+#       can fan out. Time limit: 4 h.
+#
+#   [main job]     — always submitted, waits for the last prepare job if any.
+#       32 nodes, 256 GPUs. The GLM-5 RLVR training run. Time limit: 2 h.
 #
 # If everything is already staged on Lustre, only the main job is submitted —
 # nothing is re-downloaded on the training nodes.
@@ -64,7 +72,9 @@
 #
 # MONITORING
 # ----------
-#   tail -f /lustre/fsw/portfolios/network/users/amitw/miles/logs/miles-glm5-744b-a40b-<JOBID>.out
+#   tail -f .../logs/miles-glm5-744b-a40b-download-<JOBID>.out
+#   tail -f .../logs/miles-glm5-744b-a40b-convert-<JOBID>.out
+#   tail -f .../logs/miles-glm5-744b-a40b-<JOBID>.out
 #   squeue -u amitw
 #   scancel <JOBID>
 #
@@ -84,7 +94,9 @@ MODE="${1:-nixl}"
 # --- Config ------------------------------------------------------------------
 PORTFOLIO=network_research_advdev
 PARTITION=batch
+DOWNLOAD_PARTITION=cpu_datamover
 NUM_NODES=32
+NUM_DOWNLOAD_NODES=1
 NUM_PREPARE_NODES=16
 
 MILES_FORK=git@github.com:amitw-nv/miles.git
@@ -149,56 +161,105 @@ SGLANG_SHA=$(git -C "$SGLANG_SRC" rev-parse "$SGLANG_BRANCH")
 echo "Miles  : $MILES_BRANCH @ ${MILES_SHA:0:9}"
 echo "SGLang : $SGLANG_BRANCH @ ${SGLANG_SHA:0:9}"
 
-# --- Determine whether preparation is needed ---------------------------------
-NEEDS_PREPARE=0
+# --- Determine whether download / convert are needed -------------------------
+NEEDS_DOWNLOAD=0
+NEEDS_CONVERT=0
 
 # hf download writes the shard index last; its presence means download finished.
 if [ ! -f "$HOST_MODELS/$MODEL/model.safetensors.index.json" ]; then
-    echo "HF checkpoint missing — will submit prepare job."
-    NEEDS_PREPARE=1
+    echo "HF checkpoint missing — will submit 1-node download job."
+    NEEDS_DOWNLOAD=1
+fi
+
+# run.py passes this file by absolute path, so the name is fixed.
+if [ ! -f "$HOST_DATASETS/dapo-math-17k/dapo-math-17k.jsonl" ]; then
+    echo "Dataset missing: dapo-math-17k/dapo-math-17k.jsonl — will submit 1-node download job."
+    NEEDS_DOWNLOAD=1
 fi
 
 # convert_hf_to_torch_dist.py writes 'release' into the tracker as its last
 # action, so anything else means the conversion did not finish.
 TRACKER=$HOST_CKPT/${MODEL}_torch_dist/latest_checkpointed_iteration.txt
 if [ ! -f "$TRACKER" ] || [ "$(tr -d '[:space:]' < "$TRACKER")" != "release" ]; then
-    echo "Megatron checkpoint missing or incomplete — will submit prepare job."
-    NEEDS_PREPARE=1
-fi
-
-# run.py passes this file by absolute path, so the name is fixed.
-if [ ! -f "$HOST_DATASETS/dapo-math-17k/dapo-math-17k.jsonl" ]; then
-    echo "Dataset missing: dapo-math-17k/dapo-math-17k.jsonl — will submit prepare job."
-    NEEDS_PREPARE=1
+    echo "Megatron checkpoint missing or incomplete — will submit 16-node convert job."
+    NEEDS_CONVERT=1
 fi
 
 PREV_JOB_ID=""
 
-# --- Submit prepare job if needed --------------------------------------------
-if [ "$NEEDS_PREPARE" -eq 1 ]; then
-    PREP_JOB_SCRIPT=$LOG_DIR/job-glm5-744b-a40b-prepare.slurm
-    cat > "$PREP_JOB_SCRIPT" <<PREP_SLURM
+# --- Submit 1-node download job if needed ------------------------------------
+if [ "$NEEDS_DOWNLOAD" -eq 1 ]; then
+    DL_JOB_SCRIPT=$LOG_DIR/job-glm5-744b-a40b-download.slurm
+    cat > "$DL_JOB_SCRIPT" <<DL_SLURM
 #!/bin/bash
-#SBATCH --job-name=miles-glm5-744b-a40b-prepare
+#SBATCH --job-name=miles-glm5-744b-a40b-download
+#SBATCH --partition=$DOWNLOAD_PARTITION
+#SBATCH --account=$PORTFOLIO
+#SBATCH --nodes=$NUM_DOWNLOAD_NODES
+#SBATCH --ntasks-per-node=1
+#SBATCH --time=04:00:00
+#SBATCH --output=$LOG_DIR/miles-glm5-744b-a40b-download-%j.out
+
+# Mount ONLY leaf dirs — never /root or home (breaks Megatron imports).
+srun \\
+    --container-image="$SQSH" \\
+    --no-container-mount-home \\
+    --container-name="${C_NAME}-download" \\
+    --container-mounts="$HOST_MODELS:/root/models,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets,$MILES_SRC:/root/src/miles.git:ro" \\
+    bash -lc '
+set -ex
+
+# Fetch from the Lustre mirror — login node already pulled from GitHub.
+echo "--- [Download] Updating Miles ($MILES_BRANCH @ ${MILES_SHA:0:9}) ---"
+git -C /root/miles restore . 2>/dev/null || git -C /root/miles checkout . 2>/dev/null || true
+git -C /root/miles fetch /root/src/miles.git $MILES_BRANCH
+git -C /root/miles checkout -B $MILES_BRANCH $MILES_SHA
+pip install -q "numpy<2" "scipy<1.15"
+
+# snapshot_download + dapo-math-17k. Convert is skipped. Writes land on
+# Lustre via the bind-mounts. Re-runs resume rather than redo.
+echo "--- [Download] $MODEL --download-only ---"
+cd /root/miles
+python3 examples/p2p_weight_transfer/run.py prepare $MODEL --download-only
+
+echo "--- [Download] Done ---"
+'
+DL_SLURM
+
+    DL_JOB_ID=$(sbatch --parsable "$DL_JOB_SCRIPT")
+    echo "Submitted download job $DL_JOB_ID"
+    echo "  tail -f $LOG_DIR/miles-glm5-744b-a40b-download-${DL_JOB_ID}.out"
+    PREV_JOB_ID=$DL_JOB_ID
+fi
+
+# --- Submit 16-node convert job if needed ------------------------------------
+if [ "$NEEDS_CONVERT" -eq 1 ]; then
+    CONV_DEP=""
+    [ -n "$PREV_JOB_ID" ] && CONV_DEP="--dependency=afterok:$PREV_JOB_ID"
+
+    CONV_JOB_SCRIPT=$LOG_DIR/job-glm5-744b-a40b-convert.slurm
+    cat > "$CONV_JOB_SCRIPT" <<CONV_SLURM
+#!/bin/bash
+#SBATCH --job-name=miles-glm5-744b-a40b-convert
 #SBATCH --partition=$PARTITION
 #SBATCH --account=$PORTFOLIO
 #SBATCH --nodes=$NUM_PREPARE_NODES
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 #SBATCH --time=04:00:00
-#SBATCH --output=$LOG_DIR/miles-glm5-744b-a40b-prepare-%j.out
+#SBATCH --output=$LOG_DIR/miles-glm5-744b-a40b-convert-%j.out
 
 # Mount ONLY leaf dirs — never /root or home (breaks Megatron imports).
 srun --mpi=pmix \\
     --container-image="$SQSH" \\
     --no-container-mount-home \\
-    --container-name="${C_NAME}-prepare" \\
+    --container-name="${C_NAME}-convert" \\
     --container-mounts="$HOST_MODELS:/root/models,$HOST_CKPT:/root/multinode,$HOST_DATASETS:/root/datasets,$MILES_SRC:/root/src/miles.git:ro" \\
     bash -lc '
 set -ex
 
 # Fetch from the Lustre mirror — login node already pulled from GitHub.
-echo "--- [Prepare Node \${SLURM_NODEID}] Updating Miles ($MILES_BRANCH @ ${MILES_SHA:0:9}) ---"
+echo "--- [Convert Node \${SLURM_NODEID}] Updating Miles ($MILES_BRANCH @ ${MILES_SHA:0:9}) ---"
 git -C /root/miles restore . 2>/dev/null || git -C /root/miles checkout . 2>/dev/null || true
 git -C /root/miles fetch /root/src/miles.git $MILES_BRANCH
 git -C /root/miles checkout -B $MILES_BRANCH $MILES_SHA
@@ -223,40 +284,41 @@ except Exception as e:
     print(\"ERROR resolving \" + hostname + \": \" + str(e), file=sys.stderr)
     sys.exit(1)
 ")
-echo "--- [Prepare Node \$NODE_RANK] Head IP: \$HEAD_NODE_IP ---"
+echo "--- [Convert Node \$NODE_RANK] Head IP: \$HEAD_NODE_IP ---"
 
 # convert_checkpoint uses Ray to run torchrun on every node (PP=4 x EP=32).
+# HF / dataset steps in run.py prepare no-op if already on the bind-mounts.
 ray stop --force || true
 if [ "\$NODE_RANK" -eq 0 ]; then
     RAY_memory_monitor_refresh_ms=0 ray start --head --node-ip-address "\$HEAD_NODE_IP" --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
     expected_gpus=$((NUM_PREPARE_NODES * 8))
-    echo "--- [Prepare] Waiting for \$expected_gpus GPUs in Ray cluster ---"
+    echo "--- [Convert] Waiting for \$expected_gpus GPUs in Ray cluster ---"
     while true; do
         available=\$(python3 -c "import ray; ray.init(address=\"auto\", ignore_reinit_error=True); print(int(ray.cluster_resources().get(\"GPU\", 0))); ray.shutdown()" 2>/dev/null || echo 0)
         echo "  ... \$available / \$expected_gpus GPUs"
         [ "\$available" -ge "\$expected_gpus" ] && break
         sleep 5
     done
-    echo "--- [Prepare] Downloading and converting $MODEL ---"
+    echo "--- [Convert] Converting $MODEL ---"
     cd /root/miles
     python3 examples/p2p_weight_transfer/run.py prepare $MODEL
     touch /root/multinode/.glm5-prepare-done-\$SLURM_JOB_ID
-    echo "--- [Prepare] Done ---"
+    echo "--- [Convert] Done ---"
 else
     sleep 20
     RAY_memory_monitor_refresh_ms=0 ray start --address="\$HEAD_NODE_IP:6379" --num-gpus 8 --disable-usage-stats
     while [ ! -f /root/multinode/.glm5-prepare-done-\$SLURM_JOB_ID ]; do
         sleep 15
     done
-    echo "--- [Prepare Node \$NODE_RANK] Rank 0 finished ---"
+    echo "--- [Convert Node \$NODE_RANK] Rank 0 finished ---"
 fi
 '
-PREP_SLURM
+CONV_SLURM
 
-    PREP_JOB_ID=$(sbatch --parsable "$PREP_JOB_SCRIPT")
-    echo "Submitted prepare job $PREP_JOB_ID"
-    echo "  tail -f $LOG_DIR/miles-glm5-744b-a40b-prepare-${PREP_JOB_ID}.out"
-    PREV_JOB_ID=$PREP_JOB_ID
+    CONV_JOB_ID=$(sbatch --parsable $CONV_DEP "$CONV_JOB_SCRIPT")
+    echo "Submitted convert job $CONV_JOB_ID"
+    echo "  tail -f $LOG_DIR/miles-glm5-744b-a40b-convert-${CONV_JOB_ID}.out"
+    PREV_JOB_ID=$CONV_JOB_ID
 fi
 
 MAIN_DEP=""
@@ -268,17 +330,19 @@ echo "=========================================="
 echo "  Miles cluster launch — GLM-5 744B-A40B 32-node"
 echo "=========================================="
 echo "  Portfolio : $PORTFOLIO"
-echo "  Partition : $PARTITION"
+echo "  Partition : $PARTITION (train/convert), $DOWNLOAD_PARTITION (download)"
 echo "  Model     : $MODEL"
 echo "  Mode      : $MODE"
-echo "  Nodes     : $NUM_NODES"
+echo "  Nodes     : $NUM_NODES train / $NUM_PREPARE_NODES convert / $NUM_DOWNLOAD_NODES download"
 echo "  Miles     : $MILES_BRANCH @ ${MILES_SHA:0:9}"
 echo "  SGLang    : $SGLANG_BRANCH @ ${SGLANG_SHA:0:9}"
 echo "  Container : $C_NAME (from $SQSH)"
 echo "  Model dir : $HOST_MODELS/$MODEL"
 echo "  Ckpt dir  : $HOST_CKPT/${MODEL}_torch_dist"
 echo "  Logs      : $LOG_DIR"
-[ -n "$PREV_JOB_ID" ] && echo "  Waiting on: prepare job $PREV_JOB_ID"
+[ -n "${DL_JOB_ID:-}" ] && echo "  Download  : job $DL_JOB_ID"
+[ -n "${CONV_JOB_ID:-}" ] && echo "  Convert   : job $CONV_JOB_ID"
+[ -n "$PREV_JOB_ID" ] && echo "  Train waits on: job $PREV_JOB_ID"
 echo "=========================================="
 echo ""
 
@@ -383,9 +447,11 @@ SLURM
 # --- Submit ------------------------------------------------------------------
 JOB_ID=$(sbatch --parsable $MAIN_DEP "$JOB_SCRIPT")
 
-echo "Submitted job $JOB_ID"
+echo "Submitted train job $JOB_ID"
 echo ""
 echo "Monitor:"
+[ -n "${DL_JOB_ID:-}" ] && echo "  tail -f $LOG_DIR/miles-glm5-744b-a40b-download-${DL_JOB_ID}.out"
+[ -n "${CONV_JOB_ID:-}" ] && echo "  tail -f $LOG_DIR/miles-glm5-744b-a40b-convert-${CONV_JOB_ID}.out"
 echo "  tail -f $LOG_DIR/miles-glm5-744b-a40b-${JOB_ID}.out"
 echo "  squeue -u amitw"
 echo "  scancel $JOB_ID"
