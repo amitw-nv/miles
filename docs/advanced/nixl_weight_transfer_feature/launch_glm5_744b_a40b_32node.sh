@@ -439,6 +439,9 @@ echo "--- [Node \$NODE_RANK] Head IP: \$HEAD_NODE_IP ---"
 # Megatron checkpoint exists on the shared /root/multinode mount.
 echo "--- [Node \$NODE_RANK] Starting $MODEL (mode=$MODE) ---"
 export MILES_LOG_DIR=/root/signals
+# run.py --ref-load is CKPT_SAVE_DIR/GLM-5_torch_dist; default is /root
+# which is container-local. Convert wrote the tracker on this bind-mount.
+export CKPT_SAVE_DIR=/root/multinode
 cd /root/miles
 bash examples/p2p_weight_transfer/GLM-5.sh GLM-5 $MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
 
