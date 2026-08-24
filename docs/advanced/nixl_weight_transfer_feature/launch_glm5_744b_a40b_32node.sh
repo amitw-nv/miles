@@ -197,6 +197,7 @@ if [ "$NEEDS_DOWNLOAD" -eq 1 ]; then
 #SBATCH --account=$PORTFOLIO
 #SBATCH --nodes=$NUM_DOWNLOAD_NODES
 #SBATCH --ntasks-per-node=1
+#SBATCH --mem=64G
 #SBATCH --time=04:00:00
 #SBATCH --output=$LOG_DIR/miles-glm5-744b-a40b-download-%j.out
 
