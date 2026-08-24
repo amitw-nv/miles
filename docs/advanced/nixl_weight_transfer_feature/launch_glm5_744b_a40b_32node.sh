@@ -42,6 +42,8 @@
 #
 #   [main job]     — always submitted, waits for the last prepare job if any.
 #       32 nodes, 256 GPUs. The GLM-5 RLVR training run. Time limit: 2 h.
+#       Sets OccupiedIdleGPUsJobReaper exemptIdleTimeMins=60 reason=model_loading
+#       (weight load + TileLang JIT; jobs 16502810/16502817 were reaped at 31 min).
 #
 # If everything is already staged on Lustre, only the main job is submitted —
 # nothing is re-downloaded on the training nodes.
@@ -344,6 +346,7 @@ echo "  Logs      : $LOG_DIR"
 [ -n "${DL_JOB_ID:-}" ] && echo "  Download  : job $DL_JOB_ID"
 [ -n "${CONV_JOB_ID:-}" ] && echo "  Convert   : job $CONV_JOB_ID"
 [ -n "$PREV_JOB_ID" ] && echo "  Train waits on: job $PREV_JOB_ID"
+echo "  Idle exemption: 60 min model_loading (check scontrol Comment)"
 echo "=========================================="
 echo ""
 
@@ -364,6 +367,7 @@ cat > "$JOB_SCRIPT" <<SLURM
 #SBATCH --gpus-per-node=8
 #SBATCH --time=02:00:00
 #SBATCH --output=$LOG_DIR/%x-%j.out
+#SBATCH --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"model_loading","description":"GLM-5 32-node weight load and TileLang JIT before training"}}'
 
 mkdir -p $LOG_DIR
 
