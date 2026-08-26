@@ -6,7 +6,7 @@
 # PREREQUISITES
 # -------------
 # The sqsh file must exist at:
-#   /lustre/fsw/portfolios/network/users/amitw/miles/radixark+miles+latest+120826.sqsh
+#   /lustre/fsw/portfolios/network/users/amitw/miles/radixark+miles+latest+260826.sqsh
 #
 # If it doesn't exist, create it from a compute node (login node has no space):
 #   srun -A network_research_advdev -N 1 --gpus-per-node=8 -p interactive --time=01:00:00 --pty /bin/bash
@@ -66,7 +66,7 @@
 # -----------------------
 # The named container (amitw-miles-nohome-4node) persists on each node. If it
 # gets into a broken state, delete the sqsh to force a clean rebuild:
-#   rm -f /lustre/fsw/portfolios/network/users/amitw/miles/radixark+miles+latest+120826.sqsh
+#   rm -f /lustre/fsw/portfolios/network/users/amitw/miles/radixark+miles+latest+260826.sqsh
 #   enroot import docker://radixark/miles:latest  # recreate it first
 # =============================================================================
 
@@ -87,7 +87,7 @@ SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl-upstream-exp
 
 LUSTRE=/lustre/fsw/portfolios/network/users/amitw/miles
-SQSH=$LUSTRE/radixark+miles+latest+120826.sqsh
+SQSH=$LUSTRE/radixark+miles+latest+260826.sqsh
 C_NAME=amitw-miles-nohome-4node
 
 LOG_DIR=$LUSTRE/logs
