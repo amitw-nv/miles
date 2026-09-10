@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import time
@@ -238,6 +239,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
             model_loader_extra_config=None,
             rl_quant_profile=server_args.rl_quant_profile,
         )
+        # This replica is local even when the rollout deployment spans nodes.
+        server_args = dataclasses.replace(server_args, nnodes=1)
         server_args_module.set_global_server_args_for_scheduler(server_args)
         initialize_moe_config()
         initialize_fp8_gemm_config()
