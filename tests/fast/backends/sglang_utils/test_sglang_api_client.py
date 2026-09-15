@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from miles.backends.sglang_utils import sglang_api_client
-from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
+from miles.backends.sglang_utils.sglang_api_client import SERVER_INFO_TIMEOUT_S, SGLangApiClient
 from miles.utils.http_utils import GeneralHttpClientProvider
 
 SERVER_URL = "http://fake-host:1234"
@@ -521,7 +521,7 @@ class TestInformationGetters:
         rec.install(monkeypatch, responses=[_FakeResponse(payload={"version": "0.4.0"})])
 
         assert await client.get_server_info() == {"version": "0.4.0"}
-        assert rec.calls[0][2] == {"timeout": 5.0}
+        assert rec.calls[0][2] == {"timeout": SERVER_INFO_TIMEOUT_S}
 
 
 _DIRECT_HTTP_METHODS = [

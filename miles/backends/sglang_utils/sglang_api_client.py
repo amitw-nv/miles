@@ -8,6 +8,11 @@ from miles.utils.http_utils import GeneralHttpClientProvider
 
 logger = logging.getLogger(__name__)
 
+# The engine answers /server_info from the same http server that is busy serving a weight
+# update, and its latency grows with engine size: a 64-gpu GLM-5 engine was measured right
+# at the old 5.0s ceiling, which timed out the connect path and killed the run.
+SERVER_INFO_TIMEOUT_S = 60.0
+
 
 def _compute_headers(api_key: str | None) -> dict[str, str]:
     return {
@@ -146,7 +151,7 @@ class SGLangApiClient:
     async def get_server_info(self):
         response = await GeneralHttpClientProvider.client().get(
             f"{self.server_url}/server_info",
-            timeout=5.0,
+            timeout=SERVER_INFO_TIMEOUT_S,
         )
         response.raise_for_status()
         return response.json()
