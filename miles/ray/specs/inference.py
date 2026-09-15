@@ -229,7 +229,10 @@ def _compute_spec_inference_engine(
                 if server_group_config.worker_type == "prefill"
                 else []
             ),
-            PortInfo(name="engine_info_bootstrap", static_port=12000, allow_dynamic=True),
+            # Engine-wide: sglang starts the EngineInfoBootstrap server only on node_rank 0, and
+            # every rank of the engine registers its transfer-engine info there, so nodes 1..N
+            # must be told node 0's port rather than allocating one of their own.
+            PortInfo(name="engine_info_bootstrap", static_port=12000, mode="master", allow_dynamic=True),
             PortInfo(name=GATE_PORT_NAME, static_port=13000, mode="master", allow_dynamic=True),
         ],
         env_var=lambda _ctx: envs,

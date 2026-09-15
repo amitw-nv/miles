@@ -579,7 +579,6 @@ class TestInferenceEnginePortSchema:
         assert {name for name, info in ports.items() if info.mode == "per_worker"} == {
             "primary",
             "nccl",
-            "engine_info_bootstrap",
         }
 
     def test_the_gate_port_is_allocated_once_per_cell(self, tmp_path):
@@ -1032,3 +1031,65 @@ class TestRouterInterpreterFlags:
         argv = shlex.split(spec.launch_command(_make_router_ctx()))
 
         assert argv[:6] == [sys.executable, "-O", "-X", "faulthandler", "-m", module]
+
+
+class TestEngineInfoBootstrapPortIsEngineWide:
+    """The EngineInfoBootstrap server is started only on node_rank 0 of an engine
+    (sglang ``entrypoints/engine.py``: ``if ... and server_args.node_rank == 0``), and every
+    rank of that engine PUTs its transfer-engine info to it. So all workers of a multi-node
+    engine must be told the *same* port, which is what ``mode="master"`` guarantees.
+
+    Regression test for the Qwen3-235B P2P/NIXL weight-transfer failure: with the default
+    ``per_worker`` mode each node allocated its own bootstrap port, so ranks on nodes 1..N
+    registered to ``<head-node>:<their-own-port>`` and got ECONNREFUSED. The trainer's later
+    ``GET /remote_instance_transfer_engine_info?rank=N`` then 404'd inside the bootstrap
+    server and surfaced as ``400 Bad Request``.
+    """
+
+    @staticmethod
+    def _spec_for(tmp_path, *, num_gpus_per_engine: int):
+        config_path = tmp_path / "sglang.yaml"
+        config_path.write_text(
+            make_sglang_config_yaml(
+                server_groups=[
+                    {
+                        "worker_type": "regular",
+                        "num_gpus": 64,
+                        "num_gpus_per_engine": num_gpus_per_engine,
+                    }
+                ]
+            )
+        )
+        args = make_args(
+            sglang_config=str(config_path),
+            rollout_num_gpus=64,
+            rollout_num_gpus_per_engine=num_gpus_per_engine,
+            num_gpus_per_node=8,
+        )
+        (spec,) = specs_inference_engine(args)
+        return spec
+
+    def test_a_32_gpu_engine_really_does_span_several_nodes(self, tmp_path):
+        """Guards the premise: without multiple workers per cell the bug cannot appear."""
+        spec = self._spec_for(tmp_path, num_gpus_per_engine=32)
+
+        assert spec.scheduling.num_workers_per_cell == 4
+
+    def test_the_bootstrap_port_is_shared_across_the_nodes_of_one_engine(self, tmp_path):
+        """Qwen3-235B shape: 32 gpus per engine over 8-gpu nodes."""
+        spec = self._spec_for(tmp_path, num_gpus_per_engine=32)
+
+        (bootstrap,) = [p for p in spec.port_infos if p.name == "engine_info_bootstrap"]
+
+        assert bootstrap.mode == "master", (
+            "engine_info_bootstrap is allocated per worker, so nodes 1..N of a multi-node engine "
+            "each pick their own port while the bootstrap server only listens on node 0's"
+        )
+
+    def test_it_matches_the_other_engine_wide_ports(self, tmp_path):
+        """dist_init and the gate port are already engine-wide; the bootstrap port belongs with them."""
+        spec = self._spec_for(tmp_path, num_gpus_per_engine=32)
+
+        engine_wide = {p.name for p in spec.port_infos if p.mode == "master"}
+
+        assert {"dist_init", "engine_info_bootstrap"} <= engine_wide
