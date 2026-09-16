@@ -102,7 +102,7 @@ NUM_DOWNLOAD_NODES=1
 NUM_PREPARE_NODES=16
 
 MILES_FORK=git@github.com:amitw-nv/miles.git
-MILES_BRANCH=amitw/miles-nixl-upstream-exp
+MILES_BRANCH=amitw/miles-nixl-adding-2605
 
 SGLANG_FORK=git@github.com:amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl-upstream-pr
