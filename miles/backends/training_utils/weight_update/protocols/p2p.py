@@ -540,7 +540,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
             f"missing_on_remote[:8]: {missing[:8]}"
         )
         for name, slen in zip(valid_names, source_lens, strict=True):
-            _, r_numel, r_ele = remote_session.weights_info[name]
+            # Mooncake entries are (addr, numel, ele_size); NIXL entries add a device_id.
+            r_numel, r_ele = remote_session.weights_info[name][1:3]
             assert (
                 r_numel * r_ele == slen
             ), f"[P2P-Shared] Length mismatch for {name}: local {slen}, remote {r_numel * r_ele}"
