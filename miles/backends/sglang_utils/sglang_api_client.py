@@ -130,19 +130,19 @@ class SGLangApiClient:
             payload,
         )
 
-    async def get_remote_instance_transfer_engine_info(self, rank: int):
+    async def get_remote_instance_transfer_engine_info(self, rank: int, worker: str = "target"):
         response = await GeneralHttpClientProvider.client().get(
             f"{self.server_url}/remote_instance_transfer_engine_info",
-            params={"rank": rank},
+            params={"rank": rank, "worker": worker},
             timeout=5.0,
         )
         response.raise_for_status()
         return response.json()["remote_instance_transfer_engine_info"]
 
-    async def get_parallelism_info(self, rank: int):
+    async def get_parallelism_info(self, rank: int, worker: str = "target"):
         response = await GeneralHttpClientProvider.client().get(
             f"{self.server_url}/parallelism_config",
-            params={"rank": rank},
+            params={"rank": rank, "worker": worker},
             timeout=5.0,
         )
         response.raise_for_status()

@@ -174,14 +174,25 @@ class P2PTransferManager:
         return future
 
     def wait_transfers(self) -> None:
-        """Wait for all submitted tasks to complete."""
+        """Wait for all submitted tasks; fail the update if any of them did.
+
+        Writes are submitted fire-and-forget, so this is the only place their
+        outcome is observed. A dropped transfer leaves the rollout engine
+        serving the previous step's weights with nothing downstream to notice,
+        so every failure must reach the caller. Drain all futures first so the
+        log names every failure, not just the first.
+        """
+        errors = []
         for future in self.transfer_futures:
             try:
                 future.result(timeout=self.transfer_timeout)
             except Exception as e:
                 logger.error(f"[P2P] Transfer future failed: {e}")
+                errors.append(e)
 
         self.transfer_futures.clear()
+        if errors:
+            raise RuntimeError(f"[P2P] {len(errors)} weight transfer(s) failed, first: {errors[0]}") from errors[0]
 
 
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:
@@ -235,7 +246,12 @@ def create_transfer_engine():
 
     transfer_engine = TransferEngine()
     local_ip = ray._private.services.get_node_ip_address()
-    transfer_engine.initialize(local_ip, "P2PHANDSHAKE", "rdma", "")
+    transfer_engine.initialize(
+        local_ip,
+        "P2PHANDSHAKE",
+        os.environ.get("MOONCAKE_PROTOCOL", "rdma"),
+        os.environ.get("MOONCAKE_DEVICE", ""),
+    )
     return transfer_engine
 
 
@@ -311,6 +327,7 @@ def _parse_remote_transfer_engine_info(info) -> tuple[str, dict[str, tuple[int, 
 def query_remote_weight_infos(
     rollout_engines: Sequence[SGLangApiClient],
     targets,
+    worker: str = "target",
 ) -> tuple[dict, dict, dict]:
     """Query remote rollout engines for Mooncake weight info, session IDs, and server args.
 
@@ -323,16 +340,20 @@ def query_remote_weight_infos(
 
     for engine_ind, engine_rank in targets_to_query:
         info = async_utils.run(
-            rollout_engines[engine_ind].get_remote_instance_transfer_engine_info(rank=engine_rank)
+            rollout_engines[engine_ind].get_remote_instance_transfer_engine_info(rank=engine_rank, worker=worker)
         )
-        parallelism_info = async_utils.run(rollout_engines[engine_ind].get_parallelism_info(rank=engine_rank))
+        parallelism_info = async_utils.run(
+            rollout_engines[engine_ind].get_parallelism_info(rank=engine_rank, worker=worker)
+        )
         remote_id, weights_info, backend, _agent_metadata_b64 = _parse_remote_transfer_engine_info(info)
         if backend != "mooncake":
             raise ValueError(
                 f"Expected Mooncake metadata from rollout engine {engine_ind} rank {engine_rank}, "
                 f"got backend {backend!r}"
             )
-        assert remote_id is not None, f"Failed to get remote id from rollout engine {engine_ind} rank {engine_rank}"
+        assert remote_id is not None, (
+            f"Failed to get remote id from rollout engine {engine_ind} rank {engine_rank} worker {worker}"
+        )
 
         session_id_to_server_args[remote_id] = create_server_args_from_dict(
             async_utils.run(rollout_engines[engine_ind].get_server_info())
