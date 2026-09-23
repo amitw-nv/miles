@@ -149,12 +149,16 @@ def make_args(**overrides: Any) -> Namespace:
         save=None,
         # CI
         ci_test=False,
+        ci_tito_special_token_count_threshold=0.0,
         # dumper (sglang debug dumper integration)
         dumper_enable=False,
         dumper_inference=False,
     )
     defaults.update(router_defaults)
     defaults.update(overrides)
+    defaults.setdefault("starts_inference_engines", not defaults["debug_train_only"] or defaults["eval_num_gpus"] > 0)
+    if defaults["debug_train_only"]:
+        defaults["rollout_num_gpus"] = 0
     return Namespace(**defaults)
 
 

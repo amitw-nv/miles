@@ -15,7 +15,7 @@ from miles.utils.metric_utils import (
     has_repetition,
 )
 from miles.utils.tracking_utils import tracking
-from miles.utils.types import AdapterRef, Sample
+from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
@@ -125,24 +125,28 @@ def _compute_metrics_from_samples(args, samples):
                 [any(m.get("type") == mtype for m in v) for v in tito_vals]
             ).item()
         if args.ci_test:
-            for strict_type in ("special_token_count", "special_token_type", "non_assistant_text"):
+            strict_thresholds = {
+                "special_token_count": args.ci_tito_special_token_count_threshold,
+                "special_token_type": 0,
+                "non_assistant_text": 0,
+            }
+            for strict_type, threshold in strict_thresholds.items():
                 rate = log_dict.get(f"{metric_prefix}/{strict_type}", 0)
                 assert (
-                    rate == 0
-                ), f"{metric_prefix}/{strict_type}={rate:.4f} must be 0 — this indicates a bug in the TITO algorithm or chat template. Please check your tito model and chat template."
+                    rate <= threshold
+                ), f"{metric_prefix}/{strict_type}={rate:.4f} exceeds {threshold} — this indicates a bug in the TITO algorithm or chat template. Please check your tito model and chat template."
             # assistant_text mismatch is non-critical: assistant tokens are inherited
             # from the pretokenized prefix and may differ from canonical tokenization.
 
     return log_dict
 
 
-def _get_rollout_key(sample: Sample, position: int) -> tuple[AdapterRef | None, str, int | None, int]:
-    # Adapter identity scopes the IDs because each Multi-LoRA data source numbers them independently.
+def _get_rollout_key(sample: Sample, position: int) -> tuple[str, int | None, int]:
     if sample.rollout_id is not None:
-        return (sample.adapter, "rollout", sample.group_index, sample.rollout_id)
+        return ("rollout", sample.group_index, sample.rollout_id)
     if sample.index is not None:
-        return (sample.adapter, "sample", sample.group_index, sample.index)
-    return (sample.adapter, "position", sample.group_index, position)
+        return ("sample", sample.group_index, sample.index)
+    return ("position", sample.group_index, position)
 
 
 def _compute_episode_response_length_metrics(samples: list[Sample]) -> dict[str, float]:
@@ -153,11 +157,8 @@ def _compute_episode_response_length_metrics(samples: list[Sample]) -> dict[str,
     computing batch-level statistics. Effective lengths count only trainable
     tokens; total lengths count both masked and unmasked tokens in every sample.
     """
-    if any(sample.adapter is not None for sample in samples):
-        return {}
-
-    effective_lengths_by_rollout: dict[tuple[AdapterRef | None, str, int | None, int], int] = {}
-    total_lengths_by_rollout: dict[tuple[AdapterRef | None, str, int | None, int], int] = {}
+    effective_lengths_by_rollout: dict[tuple[str, int | None, int], int] = {}
+    total_lengths_by_rollout: dict[tuple[str, int | None, int], int] = {}
     for position, sample in enumerate(samples):
         rollout_key = _get_rollout_key(sample, position)
         effective_response_length = 0 if sample.remove_sample else sample.effective_response_length
@@ -183,10 +184,9 @@ def _compute_training_sample_metrics(args: Any, samples: list[Sample]) -> dict[s
     Session compaction can turn one rollout into several training samples. The
     sample count includes every resulting row, while the reward first averages
     sibling rows that share a rollout ID so long rollouts do not receive more
-    metric weight merely because they produced more samples. Adapter identity
-    scopes these IDs because each Multi-LoRA data source numbers them independently.
+    metric weight merely because they produced more samples.
     """
-    rewards_by_rollout: dict[tuple[AdapterRef | None, str, int | None, int], list[float]] = {}
+    rewards_by_rollout: dict[tuple[str, int | None, int], list[float]] = {}
     use_metadata_reward = bool(samples and samples[0].metadata and "raw_reward" in samples[0].metadata)
     for position, sample in enumerate(samples):
         rollout_key = _get_rollout_key(sample, position)

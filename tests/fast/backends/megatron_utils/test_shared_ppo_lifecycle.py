@@ -169,7 +169,6 @@ def test_save_model_does_not_manage_lifecycle(actor_module, monkeypatch):
     reload_groups = Mock()
     destroy_groups = Mock()
     monkeypatch.setattr(actor_module, "save", save)
-    monkeypatch.setattr(actor_module, "is_multi_lora_enabled", lambda _args: False)
     monkeypatch.setattr(actor_module, "reload_process_groups", reload_groups)
     monkeypatch.setattr(actor_module, "destroy_process_groups", destroy_groups)
 
@@ -578,7 +577,6 @@ def test_critic_output_roundtrips_into_actor_external_data(actor_module: Any, mo
     monkeypatch.setattr(actor_module, "log_rollout_data", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(actor_module, "log_train_advantage_computation_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(actor_module, "log_perf_data", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(actor_module, "is_multi_lora_enabled", lambda _args: False)
     monkeypatch.setattr(actor_module.train_dump_utils, "save_debug_train_data", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(actor_module.torch.cuda, "current_device", lambda: torch.device("cpu"))
     critic_values = [torch.tensor([1.0, 2.0]), torch.tensor([3.0])]
@@ -653,7 +651,6 @@ class _RecordingWeightUpdater:
         self.connect_calls: list[dict[str, Any]] = []
         self.update_weights_calls: int = 0
         self.weight_version: int = 0
-        self.multi_lora_adapters: dict[str, Any] = {}
 
     def connect_rollout_engines(
         self,
@@ -689,7 +686,6 @@ def _weight_update_worker(actor_module: Any, monkeypatch: pytest.MonkeyPatch) ->
     worker._heartbeat = Mock()
     worker.weight_updater = _RecordingWeightUpdater()
     monkeypatch.setattr(actor_module, "print_memory", Mock())
-    monkeypatch.setattr(actor_module, "is_multi_lora_enabled", lambda _args: False)
     monkeypatch.setattr(actor_module, "get_gloo_group", lambda: None)
     monkeypatch.setattr(actor_module.dist, "barrier", lambda **_kwargs: None)
     return worker
@@ -794,6 +790,50 @@ def _updatable_engines(rollout_engines: list[Any], snapshot: dict[str, str], gpu
     )
 
 
+@pytest.mark.parametrize("offload_train", [False, True])
+@pytest.mark.parametrize("connect_fails", [False, True])
+def test_connection_uses_safe_allocations_when_offloading(
+    actor_module: Any, monkeypatch: pytest.MonkeyPatch, offload_train: bool, connect_fails: bool
+) -> None:
+    worker = _weight_update_worker(actor_module, monkeypatch)
+    worker.args.offload_train = offload_train
+    worker._asleep = offload_train
+    inside_safe_region = False
+
+    @contextmanager
+    def safe_region() -> Iterator[None]:
+        nonlocal inside_safe_region
+        assert not inside_safe_region
+        inside_safe_region = True
+        try:
+            yield
+        finally:
+            inside_safe_region = False
+
+    def check_connection(*_args: Any, **_kwargs: Any) -> None:
+        assert inside_safe_region == offload_train
+        if connect_fails:
+            raise RuntimeError("connection failed")
+
+    saver = Mock()
+    saver.disable.side_effect = safe_region
+    monkeypatch.setattr(actor_module, "torch_memory_saver", saver)
+    monkeypatch.setattr(actor_module, "reload_process_groups", Mock())
+    monkeypatch.setattr(actor_module, "destroy_process_groups", Mock())
+    worker.weight_updater.connect_rollout_engines = check_connection
+    engines = _updatable_engines([], {"cell-0": "hash-a"}, gpu_count=8)
+
+    if connect_fails:
+        with pytest.raises(RuntimeError, match="connection failed"):
+            worker.update_weights(engines)
+    else:
+        worker.update_weights(engines)
+
+    assert not inside_safe_region
+    assert saver.disable.call_count == ((1 if connect_fails else 2) if offload_train else 0)
+    assert worker.weight_updater.update_weights_calls == int(not connect_fails)
+
+
 def test_update_weights_reconnects_once_per_rollout_snapshot(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -813,27 +853,6 @@ def test_update_weights_reconnects_once_per_rollout_snapshot(
     assert updater.update_weights_calls == 3
     assert weight_version == 3
     assert not updater.conn_status.needs_reconnect({"cell-0": "hash-b"})
-
-
-def test_reconnecting_engines_receive_every_loaded_multi_lora_adapter(
-    actor_module: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Reconnecting engines get all loaded adapters even with none pending; a settled connection gets only pending."""
-    worker = _weight_update_worker(actor_module, monkeypatch)
-    updater = worker.weight_updater
-    monkeypatch.setattr(actor_module, "is_multi_lora_enabled", lambda _args: True)
-    worker.loaded_adapters = {"alpha": "alpha-weights", "beta": "beta-weights"}
-    worker._multi_lora_pending_push = set()
-    worker._is_first_replica_megatron_main_rank = False
-    engines = [object()]
-
-    worker.update_weights(_updatable_engines(engines, {"cell-0": "hash-a"}, gpu_count=4))
-    adapters_on_reconnect = updater.multi_lora_adapters
-    worker._multi_lora_pending_push = {"beta"}
-    worker.update_weights(_updatable_engines(engines, {"cell-0": "hash-a"}, gpu_count=4))
-
-    assert adapters_on_reconnect == {"alpha": "alpha-weights", "beta": "beta-weights"}
-    assert updater.multi_lora_adapters == {"beta": "beta-weights"}
 
 
 def test_reconfigure_indep_dp_forces_the_next_weight_update_to_reconnect(

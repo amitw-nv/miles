@@ -13,7 +13,7 @@ from miles.ray.rollout.metrics import (
     log_rollout_data,
 )
 from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY
-from miles.utils.types import AdapterRef, Sample, WeightVersionSpan, WeightVersionsPerCall
+from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 
 class TestEpisodeResponseLengthMetrics:
@@ -61,18 +61,6 @@ class TestEpisodeResponseLengthMetrics:
 
         assert out["episode_response_length/mean"] == pytest.approx(4.5)
         assert out["episode_total_response_length/mean"] == pytest.approx(8.0)
-
-    def test_multi_lora_samples_emit_no_episode_length_metrics(self):
-        samples = [
-            make_sample(index=0, rollout_id=10, adapter=AdapterRef(name="adapter-a", slot=0)),
-            make_sample(index=0, rollout_id=10, adapter=AdapterRef(name="adapter-b", slot=1)),
-        ]
-
-        assert _compute_episode_response_length_metrics(samples) == {}
-        out = _compute_metrics_from_samples(make_args(advantage_estimator="ppo"), samples)
-        assert not any(key.startswith("episode_response_length/") for key in out)
-        assert "episode_total_response_length/mean" not in out
-        assert out["response_len/mean"] == pytest.approx(4.0)
 
     def test_removed_sample_has_zero_effective_length_but_keeps_total_length(self):
         sample = make_sample(
@@ -122,21 +110,6 @@ class TestTrainingSampleMetrics:
             make_sample(group_index=0, index=0, rollout_id=10, reward=1.0),
             make_sample(group_index=0, index=0, rollout_id=10, reward=1.0),
             make_sample(group_index=1, index=1, rollout_id=10, reward=0.0),
-        ]
-
-        out = _compute_training_sample_metrics(args, samples)
-
-        assert out["episode_raw_reward"] == pytest.approx(0.5)
-
-    def test_rollout_ids_are_scoped_by_adapter(self):
-        args = make_args(reward_key=None)
-        adapter_a = AdapterRef(name="adapter-a", slot=0)
-        adapter_b = AdapterRef(name="adapter-b", slot=1)
-        samples = [
-            make_sample(group_index=0, rollout_id=10, adapter=adapter_a, reward=1.0),
-            make_sample(group_index=0, rollout_id=10, adapter=adapter_a, reward=1.0),
-            make_sample(group_index=0, rollout_id=10, adapter=adapter_a, reward=1.0),
-            make_sample(group_index=0, rollout_id=10, adapter=adapter_b, reward=0.0),
         ]
 
         out = _compute_training_sample_metrics(args, samples)
@@ -338,6 +311,35 @@ class TestTitoMismatchMetrics:
             match=r"tito_session_mismatch_rate/v1/special_token_count=0\.2500",
         ):
             _compute_metrics_from_samples(args, samples)
+
+    @pytest.mark.parametrize(
+        ("mismatch_type", "threshold", "raises"),
+        [
+            ("special_token_count", 0.25, False),
+            ("special_token_count", 0.2, True),
+            ("special_token_type", 0.25, True),
+        ],
+    )
+    def test_special_token_count_threshold_under_ci_test(self, mismatch_type, threshold, raises):
+        """The special_token_count threshold only relaxes that type; the
+        other strict types stay at 0."""
+        args = make_args(
+            advantage_estimator="ppo",
+            ci_test=True,
+            ci_tito_special_token_count_threshold=threshold,
+            log_passrate=False,
+            use_session_server="v2",
+        )
+        samples = make_samples_grouped(1, 4)
+        samples[0].metadata = {"tito_session_mismatch": [{"type": mismatch_type}]}
+        for s in samples[1:]:
+            s.metadata = {"tito_session_mismatch": []}
+        if raises:
+            with pytest.raises(AssertionError, match=rf"tito_session_mismatch_rate/v2/{mismatch_type}=0\.2500"):
+                _compute_metrics_from_samples(args, samples)
+        else:
+            out = _compute_metrics_from_samples(args, samples)
+            assert out[f"tito_session_mismatch_rate/v2/{mismatch_type}"] == 0.25
 
     def test_assistant_text_mismatch_does_not_raise_under_ci_test(self):
         """assistant_text mismatch is non-critical (tokens inherited from the

@@ -1,8 +1,10 @@
 """Megatron implementations' shared base and factory for the backend-neutral
 HF weight iterator API."""
 
+import json
 import logging
 import math
+import os
 from abc import abstractmethod
 from argparse import Namespace
 from collections.abc import Sequence
@@ -28,6 +30,12 @@ class MegatronHfWeightIteratorBase(HfWeightIteratorBase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.packed_weight_basenames = (
+            get_packed_weight_basenames(self.args.hf_checkpoint)
+            if self.quantization_config is not None
+            and self.quantization_config["quant_method"] == "compressed-tensors"
+            else None
+        )
         trainer_has_mtp = bool(unwrap_model(self.model)[0].config.mtp_num_layers)
         if self.args.sglang_speculative_algorithm and not trainer_has_mtp:
             self.weight_update_selector = "target"
@@ -35,7 +43,7 @@ class MegatronHfWeightIteratorBase(HfWeightIteratorBase):
     def _hf_atomic_update_groups(self):
         return get_hf_atomic_update_groups(self.model_name, q_lora_rank=self.args.q_lora_rank)
 
-    def _iter_hf_adapter_units(self, lora_name, adapter, *, materialize):
+    def _iter_hf_adapter_units(self, adapter, *, materialize):
         """Both megatron exporters are PP-local after gathering TP/EP; the PP
         gather runs only where the resolved placement asks for it."""
         named_tensors = self._export_pp_local_lora(adapter)
@@ -47,15 +55,13 @@ class MegatronHfWeightIteratorBase(HfWeightIteratorBase):
             return
         if not named_tensors:
             raise RuntimeError(
-                f"LoRA weight sync failed: the adapter export produced zero tensors"
-                f"{f' for adapter {adapter!r}' if adapter is not None else ''}. "
-                "This usually means the Megatron-Bridge or SGLang version is incompatible."
+                f"LoRA weight sync failed: the adapter export produced zero tensors{f' for adapter {adapter!r}' if adapter is not None else ''}. This usually means the Megatron-Bridge or SGLang version is incompatible."
             )
         if not any(is_lora_weight_name(name) for name, _tensor in named_tensors):
             raise RuntimeError("LoRA weight sync failed: the adapter export contains no lora_A/lora_B names.")
         while named_tensors:
             hf_name, tensor = named_tensors.pop(0)
-            yield [(f"{lora_name}:{hf_name}", tensor)]
+            yield [(hf_name, tensor)]
 
     @abstractmethod
     def _export_pp_local_lora(self, adapter) -> list[tuple[str, torch.Tensor]]:
@@ -85,6 +91,15 @@ def get_hf_weight_iterator(
         model_name=model_name,
         quantization_config=quantization_config,
     )
+
+
+def get_packed_weight_basenames(hf_checkpoint: str) -> set[str]:
+    """Base names the checkpoint stores as compressed-tensors `weight_packed`; the quantizer
+    re-quantizes exactly these, since the published `ignore` list is written for loaders and
+    leaves out BF16 weights such as routers, residual projections and the vision tower."""
+    with open(os.path.join(hf_checkpoint, "model.safetensors.index.json")) as index_file:
+        names = json.load(index_file)["weight_map"]
+    return {n.removesuffix(".weight_packed") for n in names if n.endswith(".weight_packed")}
 
 
 def _gather_pp_full_adapter(
