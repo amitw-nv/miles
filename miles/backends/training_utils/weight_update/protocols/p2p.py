@@ -23,6 +23,12 @@ from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
+from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
+    add_wire_bytes,
+    gather_and_write_perf_log,
+    new_collector,
+    reset_collector,
+)
 from miles.utils.distributed_utils import get_gloo_group
 
 from .p2p_transfer_utils import (
@@ -56,6 +62,15 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self.transfer_backend = args.update_weight_transfer_backend
         self.transfer_plan = RemoteTransferPlan(args)
         self.global_rank = dist.get_rank(group=get_gloo_group())
+        self._nixl_perf = (
+            new_collector(
+                gpu=self.global_rank,
+                pp_rank=self.transfer_plan._pp_rank,
+                gathered_dp_rank=self.transfer_plan._gathered_dp_rank,
+            )
+            if self.transfer_backend == "nixl"
+            else None
+        )
         self._model_registered = False
         self._tensor_update_pending: dict[str, int] = {}
 
@@ -68,17 +83,20 @@ class UpdateWeightP2P(WeightTransferProtocol):
     def after_base_weights(self) -> None:
         """Wait for all background P2P writes to complete."""
         if not self.is_sender:
+            gather_and_write_perf_log(self._nixl_perf, is_sender=False)
             return
         self.transfer_manager.wait_transfers()
         assert len(self._tensor_update_pending) == 0 and len(self._staged_tensors) == 0, (
             f"Some tensors were not transferred during P2P weight update. "
             f"Pending: {self._tensor_update_pending}, Staged: {self._staged_tensors}"
         )
+        gather_and_write_perf_log(self._nixl_perf, is_sender=True)
 
     def begin_sync(
         self, weight_version: int, iter_buckets: Callable[..., Iterator[list[tuple[str, torch.Tensor]]]]
     ) -> bool:
         """Register shared CPU pinned memory with the active P2P backend on the first sync."""
+        reset_collector(self._nixl_perf, weight_version)
         if self.is_sender and not self._model_registered:
             if self.transfer_backend == "nixl":
                 self._weight_memory_registry = register_cpu_memory_nixl(self._nixl_agent, self._shared_params_dict)
@@ -356,6 +374,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
 
         if not source_ptrs:
             return
+
+        add_wire_bytes(self._nixl_perf, sum(source_lens))
 
         session_id = remote_session.session_id
         target_ptrs = []

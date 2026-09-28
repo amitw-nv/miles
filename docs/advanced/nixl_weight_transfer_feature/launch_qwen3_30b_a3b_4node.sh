@@ -59,6 +59,7 @@
 # MONITORING
 # ----------
 #   tail -f /lustre/fsw/portfolios/network/users/amitw/miles/logs/miles-qwen3-30b-a3b-<JOBID>.out
+#   tail -f /lustre/fsw/portfolios/network/users/amitw/miles/logs/signals-<JOBID>/p2p_nixl_perf.log
 #   squeue -u amitw
 #   scancel <JOBID>
 #
@@ -320,5 +321,6 @@ echo "Submitted job $JOB_ID"
 echo ""
 echo "Monitor:"
 echo "  tail -f $LOG_DIR/miles-qwen3-30b-a3b-${JOB_ID}.out"
+echo "  tail -f $LOG_DIR/signals-${JOB_ID}/p2p_nixl_perf.log"
 echo "  squeue -u amitw"
 echo "  scancel $JOB_ID"
