@@ -56,6 +56,12 @@ class WeightTransferProtocol(ABC):
     @abstractmethod
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None: ...
 
+    def wrap_weight_iter(
+        self, buckets: Iterator[list[tuple[str, torch.Tensor]]]
+    ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        """Identity wrap. NIXL P2P overrides this to start gpu-prep at each `next()`."""
+        return buckets
+
     def after_base_weights(self) -> None:  # noqa: B027 — optional hook
         """Hook after the base-weight stream completes (e.g. await in-flight writes)."""
 

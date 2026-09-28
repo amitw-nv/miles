@@ -110,6 +110,7 @@ class TestUpdateWeightsEmptyBaseIteration:
         protocol.is_sender = True
         protocol.group_name = "test"
         protocol.begin_sync.return_value = True
+        protocol.wrap_weight_iter = lambda buckets: buckets
         protocol.rollout_engines = [MagicMock()]
 
         args = _make_args(custom_model_provider_path=None, check_lora_weight_equal=False)

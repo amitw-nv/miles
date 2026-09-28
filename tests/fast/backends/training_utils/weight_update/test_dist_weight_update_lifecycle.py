@@ -81,6 +81,7 @@ def _make_updater(engines: list[_RecordingApiClient], *, pause_generation_mode: 
         required_placement=MagicMock(),
         supports_lora=False,
         begin_sync=lambda weight_version, iter_buckets: True,
+        wrap_weight_iter=lambda buckets: buckets,
         send_bucket=MagicMock(),
         after_base_weights=MagicMock(),
         finalize=MagicMock(),
