@@ -24,10 +24,14 @@ from miles.backends.training_utils.parallel import ParallelState
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
 from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
+    add_session_wire_time,
     add_wire_bytes,
+    begin_wire_group,
+    current_wire_group,
     gather_and_write_perf_log,
     new_collector,
     reset_collector,
+    timed_call,
 )
 from miles.utils.distributed_utils import get_gloo_group
 
@@ -123,6 +127,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
             for i, (model_replica, remote_weight_infos) in enumerate(self._transfer_engine_meta_list):
                 model_replica.load_weights(ready_hf_tensors)
 
+                begin_wire_group(self._nixl_perf)
                 is_last = i == last_idx
                 if is_last:
                     # Last engine rank: fire-and-forget all sessions to background,
@@ -360,6 +365,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         Used by the parallelized submission path where each session within an
         engine rank is submitted as a separate task to P2PTransferManager.
         """
+        wire_group = current_wire_group(self._nixl_perf)
         source_ptrs, source_lens = [], []
         valid_names = []
 
@@ -394,7 +400,10 @@ class UpdateWeightP2P(WeightTransferProtocol):
         )
 
         if remote_session.backend == "nixl":
-            self._do_nixl_write(remote_session, source_ptrs, source_lens, target_ptrs, target_device_ids)
+            elapsed = timed_call(
+                self._do_nixl_write, remote_session, source_ptrs, source_lens, target_ptrs, target_device_ids
+            )
+            add_session_wire_time(self._nixl_perf, elapsed, group_id=wire_group)
             return
 
         ret = self._transfer_engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
