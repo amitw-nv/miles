@@ -62,9 +62,13 @@ after the other on the shared buffer) and across every outer `send_bucket`.
 
 ## trainer_prep_time
 
-Two parts, still measured separately per GPU. The log picks **one** GPU: the one
-whose `gpu_prep + cpu_prep` is largest. Do not take the max gpu-prep GPU and
-the max cpu-prep GPU and add those (those can be different GPUs).
+Two parts, still measured separately per GPU. The log has **three** numbers,
+each with the GPU that owns that max (they can be three different GPUs):
+
+- max `gpu_prep`
+- max `cpu_prep`
+- max `gpu_prep + cpu_prep` on the **same** GPU (do not add the two category
+  maxes from different GPUs)
 
 ### 1. gpu
 
@@ -84,8 +88,8 @@ one GPU run one after the other: **sum** them. Pointer setup for several
 sessions of the same replica can run in parallel: count that group **once**
 (longest), like `wire_time`. Then sum every outer `send_bucket`.
 
-**What you see in the log:** The GPU with the largest `gpu_prep + cpu_prep`
-(both from that same GPU).
+**What you see in the log:** Three lines: GPU with max gpu-prep, GPU with max
+cpu-prep, GPU with max `gpu_prep + cpu_prep` (same GPU).
 
 ---
 
@@ -121,11 +125,12 @@ and `gathered_dp_rank` on the payload. Reset counters at the start of each
 
 Every sender rank measures itself. Rank 0 only **gathers and writes the
 file** so one shared log is not appended by many processes at once.
-Non-senders send `None`. The printed line is the bottleneck GPU (max bytes,
-max wire_time, max prep sum, max active) — that is the trainer-side P2P
-path, not rollout `post_load_weights`. Because all-gather is lockstep and
-`update_weights` ends on a gloo barrier, the max `trainer_active_time` is
-the stall the system waits on.
+Non-senders send `None`. Rank 0 prints the bottleneck GPU per metric (max
+bytes, max wire_time, max gpu_prep, max cpu_prep, max gpu+cpu on one GPU,
+max active). That is the trainer-side P2P path, not rollout
+`post_load_weights`. Because all-gather is lockstep and `update_weights`
+ends on a gloo barrier, the max `trainer_active_time` is the stall the
+system waits on.
 
 Aggregation (full transfer = one log section):
 
@@ -133,14 +138,19 @@ Aggregation (full transfer = one log section):
 |---|---|---|---|---|---|
 | `max_num_wire_bytes_per_trainer` | `sum(source_lens)` in `_do_p2p_write_one_session` | **sum** (every session) | sum | sum | GPU with max bytes |
 | `wire_time` | timer around `_do_nixl_write` | **max** (count once) | sum | sum | GPU with max work |
-| `trainer_prep_time` gpu | `next(iterator)` until before `load_weights` | n/a (outer, main thread) | n/a | sum | see pick below |
-| `trainer_prep_time` cpu | `load_weights` + setup until before `_do_nixl_write` | **max** on setup | **sum** (`load_weights`) | sum | see pick below |
+| `trainer_prep_time` gpu | `next(iterator)` until before `load_weights` | n/a (outer, main thread) | n/a | sum | GPU with max gpu_prep |
+| `trainer_prep_time` cpu | `load_weights` + setup until before `_do_nixl_write` | **max** on setup | **sum** (`load_weights`) | sum | GPU with max cpu_prep |
 | `trainer_active_time` | first `next(iterator)` → `wait_transfers()` done | n/a | n/a | n/a (one wall clock) | GPU with max active |
 
 Each sender payload carries that rank’s `gpu_prep` and `cpu_prep`. Rank 0
-picks `argmax(gpu_prep + cpu_prep)` on **that same GPU**, then prints one
-`trainer_prep_time` line with that GPU’s gpu, cpu, and total. Do not
-`max(gpu_prep) + max(cpu_prep)` across different GPUs.
+prints three picks:
+
+- `argmax(gpu_prep)`
+- `argmax(cpu_prep)`
+- `argmax(gpu_prep + cpu_prep)` on **that same GPU**
+
+Do not define the third number as `max(gpu_prep) + max(cpu_prep)` across
+different GPUs.
 
 Hook sites:
 
@@ -161,7 +171,9 @@ Log (rank 0, append, one section per `weight_version`):
 === p2p nixl perf  weight_version=12 ===
 max_num_wire_bytes_per_trainer: gpu=5 bytes=12.40GiB
 wire_time: gpu=5 work=2.110s
-trainer_prep_time: gpu=5 gpu_prep=0.91s cpu_prep=0.40s total=1.31s
+trainer_prep_time_gpu: gpu=5 time=0.91s
+trainer_prep_time_cpu: gpu=2 time=0.55s
+trainer_prep_time_total: gpu=5 gpu_prep=0.91s cpu_prep=0.40s total=1.31s
 trainer_active_time: gpu=5 time=3.410s
 ```
 
