@@ -10,7 +10,7 @@ from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import 
     add_session_wire_time,
     add_wire_bytes,
     begin_wire_group,
-    format_gib,
+    format_gb,
     format_perf_section,
     format_prep_seconds,
     format_seconds,
@@ -25,7 +25,7 @@ from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import 
 )
 
 _MODULE = "miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf"
-_GIB = 1024**3
+_GB = 1000**3
 
 
 def _payload(
@@ -57,7 +57,7 @@ def _section(
     *,
     weight_version: int,
     bytes_gpu: int,
-    bytes_gib: str,
+    bytes_gb: str,
     wire_gpu: int,
     wire_s: str,
     gpu_prep_gpu: int = 0,
@@ -73,7 +73,7 @@ def _section(
 ) -> str:
     return (
         f"=== p2p nixl perf  weight_version={weight_version} ===\n"
-        f"max_num_wire_bytes_per_trainer: gpu={bytes_gpu} bytes={bytes_gib}\n"
+        f"max_num_wire_bytes_per_trainer: gpu={bytes_gpu} bytes={bytes_gb}\n"
         f"wire_time: gpu={wire_gpu} work={wire_s}\n"
         f"trainer_prep_time_gpu: gpu={gpu_prep_gpu} time={gpu_prep_s}\n"
         f"trainer_prep_time_cpu: gpu={cpu_prep_gpu} time={cpu_prep_s}\n"
@@ -86,10 +86,15 @@ def _section(
 class TestP2PNixlPerfHelpers:
     """Byte accounting, wire_time folds, trainer_prep_time folds, and the rank-0 log section."""
 
-    def test_format_gib_matches_the_log_example(self):
-        """The log prints GiB with two decimals so a 12.40GiB line is readable without raw byte counts."""
-        assert format_gib(int(12.40 * _GIB)) == "12.40GiB"
-        assert format_gib(0) == "0.00GiB"
+    def test_format_gb_matches_the_log_example(self):
+        """The log prints decimal GB with two decimals so a 13.31GB line is readable without raw byte counts."""
+        assert format_gb(int(13.31 * _GB)) == "13.31GB"
+        assert format_gb(0) == "0.00GB"
+
+    def test_format_gb_is_decimal_not_binary(self):
+        """Decimal base keeps wire bytes / wire_time directly comparable to NIC line rates."""
+        assert format_gb(1000**3) == "1.00GB"
+        assert format_gb(1024**3) == "1.07GB"
 
     def test_format_seconds_matches_the_log_example(self):
         """wire_time is printed as work=2.110s so the bottleneck GPU is comparable across ranks."""
@@ -109,7 +114,7 @@ class TestP2PNixlPerfHelpers:
                 _payload(gpu=2, wire_bytes=10, wire_time=2.110, gpu_prep=0.20, cpu_prep=0.55, active_time=1.0),
                 _payload(
                     gpu=5,
-                    wire_bytes=int(12.40 * _GIB),
+                    wire_bytes=int(13.31 * _GB),
                     wire_time=0.4,
                     gpu_prep=0.91,
                     cpu_prep=0.40,
@@ -121,7 +126,7 @@ class TestP2PNixlPerfHelpers:
         assert text == _section(
             weight_version=12,
             bytes_gpu=5,
-            bytes_gib="12.40GiB",
+            bytes_gb="13.31GB",
             wire_gpu=2,
             wire_s="2.110s",
             gpu_prep_gpu=5,
@@ -280,7 +285,7 @@ class TestGatherAndWritePerfLog:
             _payload(gpu=2, wire_bytes=55, weight_version=12, wire_time=0.5, gpu_prep=0.20, cpu_prep=0.55, active_time=1.0),
             _payload(
                 gpu=5,
-                wire_bytes=int(12.40 * _GIB),
+                wire_bytes=int(13.31 * _GB),
                 weight_version=12,
                 wire_time=2.110,
                 gpu_prep=0.91,
@@ -293,7 +298,7 @@ class TestGatherAndWritePerfLog:
         assert log_path.read_text(encoding="utf-8") == _section(
             weight_version=12,
             bytes_gpu=5,
-            bytes_gib="12.40GiB",
+            bytes_gb="13.31GB",
             wire_gpu=5,
             wire_s="2.110s",
             gpu_prep_gpu=5,
@@ -315,31 +320,37 @@ class TestGatherAndWritePerfLog:
         reset_collector(collector, weight_version=1)
         with patch(
             f"{_MODULE}._gather_payloads",
-            return_value=[_payload(gpu=1, wire_bytes=_GIB, weight_version=1, wire_time=1.0)],
+            return_value=[_payload(gpu=1, wire_bytes=_GB, weight_version=1, wire_time=1.0)],
         ):
             gather_and_write_perf_log(collector, is_sender=True, log_path=log_path)
         reset_collector(collector, weight_version=2)
         with patch(
             f"{_MODULE}._gather_payloads",
-            return_value=[_payload(gpu=1, wire_bytes=2 * _GIB, weight_version=2, wire_time=2.0)],
+            return_value=[_payload(gpu=1, wire_bytes=2 * _GB, weight_version=2, wire_time=2.0)],
         ):
             gather_and_write_perf_log(collector, is_sender=True, log_path=log_path)
         assert log_path.read_text(encoding="utf-8") == (
             _section(
                 weight_version=1,
                 bytes_gpu=1,
-                bytes_gib="1.00GiB",
+                bytes_gb="1.00GB",
                 wire_gpu=1,
                 wire_s="1.000s",
+                gpu_prep_gpu=1,
+                cpu_prep_gpu=1,
+                total_gpu=1,
                 active_gpu=1,
                 active_s="0.000s",
             )
             + _section(
                 weight_version=2,
                 bytes_gpu=1,
-                bytes_gib="2.00GiB",
+                bytes_gb="2.00GB",
                 wire_gpu=1,
                 wire_s="2.000s",
+                gpu_prep_gpu=1,
+                cpu_prep_gpu=1,
+                total_gpu=1,
                 active_gpu=1,
                 active_s="0.000s",
             )

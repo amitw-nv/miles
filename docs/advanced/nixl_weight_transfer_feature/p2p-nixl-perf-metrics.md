@@ -41,6 +41,12 @@ the RDMA payload. Sum every inner write on that GPU, over every outer
 
 **What you see in the log:** Which GPU sent the most, and how many bytes.
 
+Bytes print as decimal **GB** (10^9), not GiB (2^30), so this line divided by
+`wire_time` is directly comparable to a NIC line rate without a base change.
+Note the surrounding `memory_utils` lines (`total_GB`, `free_GB`) are binary
+values carrying a `GB` label, so the two are not the same unit despite the
+matching suffix.
+
 ---
 
 ## wire_time
@@ -169,7 +175,7 @@ Log (rank 0, append, one section per `weight_version`):
 
 ```text
 === p2p nixl perf  weight_version=12 ===
-max_num_wire_bytes_per_trainer: gpu=5 bytes=12.40GiB
+max_num_wire_bytes_per_trainer: gpu=5 bytes=13.31GB
 wire_time: gpu=5 work=2.110s
 trainer_prep_time_gpu: gpu=5 time=0.91s
 trainer_prep_time_cpu: gpu=2 time=0.55s

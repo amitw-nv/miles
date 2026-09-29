@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 LOG_FILENAME = "p2p_nixl_perf.log"
-_GIB = 1024**3
+# Decimal GB (10^9), matching how NIC line rates are quoted, so wire bytes can be
+# divided by wire_time and compared against link bandwidth without a base change.
+_GB = 1000**3
 
 
 class TimeMonitor:
@@ -364,9 +366,9 @@ def perf_log_path() -> Path:
     return Path(os.environ.get("MILES_LOG_DIR") or os.getcwd()) / LOG_FILENAME
 
 
-def format_gib(num_bytes: int) -> str:
-    """Render wire bytes as `12.40GiB` for the `max_num_wire_bytes_per_trainer` log line."""
-    return f"{num_bytes / _GIB:.2f}GiB"
+def format_gb(num_bytes: int) -> str:
+    """Render wire bytes as `13.31GB` for the `max_num_wire_bytes_per_trainer` log line."""
+    return f"{num_bytes / _GB:.2f}GB"
 
 
 def format_seconds(num_seconds: float) -> str:
@@ -397,7 +399,7 @@ def format_perf_section(weight_version: int, payloads: list[dict[str, int | floa
     total_cpu_prep = float(best_total["cpu_prep"])
     return (
         f"=== p2p nixl perf  weight_version={weight_version} ===\n"
-        f"max_num_wire_bytes_per_trainer: gpu={best_bytes['gpu']} bytes={format_gib(int(best_bytes['wire_bytes']))}\n"
+        f"max_num_wire_bytes_per_trainer: gpu={best_bytes['gpu']} bytes={format_gb(int(best_bytes['wire_bytes']))}\n"
         f"wire_time: gpu={best_wire['gpu']} work={format_seconds(float(best_wire['wire_time']))}\n"
         f"trainer_prep_time_gpu: gpu={best_gpu_prep['gpu']} time={format_prep_seconds(float(best_gpu_prep['gpu_prep']))}\n"
         f"trainer_prep_time_cpu: gpu={best_cpu_prep['gpu']} time={format_prep_seconds(float(best_cpu_prep['cpu_prep']))}\n"
