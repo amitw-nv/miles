@@ -17,8 +17,9 @@ class TimeMonitor:
     `wire_time` uses this around `_do_nixl_write`. `trainer_prep_time` gpu uses
     one instance on the collector from `next(iterator)` until before
     `load_weights`. `trainer_prep_time` cpu uses a per-session instance for
-    pointer setup until before `_do_nixl_write`. `timed_call` uses a fresh
-    instance around one function.
+    pointer setup until before `_do_nixl_write`. `trainer_active_time` uses one
+    instance from the first `next(iterator)` until after `wait_transfers()`.
+    `timed_call` uses a fresh instance around one function.
     """
 
     def __init__(self) -> None:
@@ -49,7 +50,8 @@ class P2PNixlPerfCollector:
     `max_num_wire_bytes_per_trainer`. Per-replica session times feed `wire_time`
     (max within a replica, then sum across replicas and `send_bucket` steps).
     `gpu_prep` sums outer `next(iterator)` intervals. `cpu_prep` sums
-    `load_weights` plus max pointer-setup per replica group.
+    `load_weights` plus max pointer-setup per replica group. `active_time` is
+    one wall clock from the first `next(iterator)` until `wait_transfers()`.
     """
 
     gpu: int
@@ -63,7 +65,10 @@ class P2PNixlPerfCollector:
     _cpu_setup_groups: dict[int, list[float]] = field(default_factory=dict)
     _gpu_prep: float = 0.0
     _cpu_load: float = 0.0
+    _active_time: float = 0.0
+    _active_started: bool = False
     _gpu_prep_monitor: TimeMonitor = field(default_factory=TimeMonitor)
+    _active_monitor: TimeMonitor = field(default_factory=TimeMonitor)
 
     def reset(self, weight_version: int) -> None:
         """Clear counters at the start of this `update_weights`.
@@ -79,7 +84,10 @@ class P2PNixlPerfCollector:
         self._cpu_setup_groups = {}
         self._gpu_prep = 0.0
         self._cpu_load = 0.0
+        self._active_time = 0.0
+        self._active_started = False
         self._gpu_prep_monitor.cancel()
+        self._active_monitor.cancel()
 
     def add_wire_bytes(self, num_bytes: int) -> None:
         """Record RDMA payload size for one inner session write.
@@ -149,6 +157,19 @@ class P2PNixlPerfCollector:
         """Drop a gpu-prep start that did not yield a bucket (`StopIteration`)."""
         self._gpu_prep_monitor.cancel()
 
+    def start_active_time(self) -> None:
+        """Start `trainer_active_time` once, at the first `next(iterator)` of this transfer."""
+        if self._active_started:
+            return
+        self._active_started = True
+        self._active_monitor.start()
+
+    def stop_active_time(self) -> None:
+        """Stop `trainer_active_time` after `wait_transfers()` and keep that one elapsed."""
+        if not self._active_monitor.running():
+            return
+        self._active_time = self._active_monitor.stop()
+
     def wire_bytes(self) -> int:
         """Total bytes this GPU put on the wire in this transfer.
 
@@ -181,13 +202,22 @@ class P2PNixlPerfCollector:
         setup = sum(max(times) for times in self._cpu_setup_groups.values() if times)
         return self._cpu_load + setup
 
+    def active_time(self) -> float:
+        """Wall clock of this full transfer on this GPU.
+
+        `trainer_active_time`: first `next(iterator)` until `wait_transfers()`
+        returns. Not a sum of outer or inner times (those overlap). Rank 0 logs
+        the GPU with the largest active time.
+        """
+        return self._active_time
+
     def payload(self) -> dict[str, int | float]:
         """Snapshot this rank sends on the gloo gather.
 
         Rank 0 uses `wire_bytes` for `max_num_wire_bytes_per_trainer`, `wire_time`
-        for `wire_time`, and `gpu_prep` / `cpu_prep` for the three
-        `trainer_prep_time` picks, and keeps `gpu` / `pp_rank` / `gathered_dp_rank`
-        to label those lines in the log.
+        for `wire_time`, `gpu_prep` / `cpu_prep` for the three `trainer_prep_time`
+        picks, and `active_time` for `trainer_active_time`, and keeps `gpu` /
+        `pp_rank` / `gathered_dp_rank` to label those lines in the log.
         """
         return {
             "gpu": self.gpu,
@@ -197,12 +227,17 @@ class P2PNixlPerfCollector:
             "wire_time": self.wire_time(),
             "gpu_prep": self.gpu_prep(),
             "cpu_prep": self.cpu_prep(),
+            "active_time": self.active_time(),
             "weight_version": self.weight_version,
         }
 
 
 class _GpuPrepIter:
-    """Starts gpu-prep on each `next()`; cancels if the inner iterator is done."""
+    """Starts gpu-prep on each `next()` and active time on the first `next()`.
+
+    Cancels gpu-prep if the inner iterator is done. Leaves active time running
+    until `stop_active_time` after `wait_transfers()`.
+    """
 
     def __init__(self, collector: P2PNixlPerfCollector, inner: Iterator[Any]) -> None:
         self._collector = collector
@@ -212,6 +247,7 @@ class _GpuPrepIter:
         return self
 
     def __next__(self) -> Any:
+        self._collector.start_active_time()
         self._collector.start_gpu_prep()
         try:
             return next(self._inner)
@@ -259,7 +295,7 @@ def current_wire_group(collector: P2PNixlPerfCollector | None) -> int | None:
 
 
 def wrap_gpu_prep_iter(collector: P2PNixlPerfCollector | None, buckets: Iterator[Any]) -> Iterator[Any]:
-    """Start `trainer_prep_time` gpu at each `next(iterator)`. No-op on mooncake.
+    """Start gpu-prep at each `next(iterator)` and active time on the first. No-op on mooncake.
 
     The updater wraps the HF iterator through the protocol so it does not import NIXL.
     """
@@ -272,6 +308,12 @@ def stop_gpu_prep(collector: P2PNixlPerfCollector | None) -> None:
     """No-op on mooncake. On NIXL, stop gpu-prep right before `load_weights`."""
     if collector is not None:
         collector.stop_gpu_prep()
+
+
+def stop_active_time(collector: P2PNixlPerfCollector | None) -> None:
+    """No-op on mooncake. On NIXL, stop `trainer_active_time` after `wait_transfers()`."""
+    if collector is not None:
+        collector.stop_active_time()
 
 
 def add_cpu_load(collector: P2PNixlPerfCollector | None, duration: float) -> None:
@@ -328,7 +370,7 @@ def format_gib(num_bytes: int) -> str:
 
 
 def format_seconds(num_seconds: float) -> str:
-    """Render seconds as `2.110s` for the `wire_time` log line."""
+    """Render seconds as `2.110s` / `3.410s` for `wire_time` and `trainer_active_time`."""
     return f"{num_seconds:.3f}s"
 
 
@@ -341,14 +383,16 @@ def format_perf_section(weight_version: int, payloads: list[dict[str, int | floa
     """One log section for this `weight_version`.
 
     Prints `max_num_wire_bytes_per_trainer` (GPU with the most wire bytes),
-    `wire_time` (GPU with the most RDMA work), and three `trainer_prep_time`
-    picks: max gpu_prep, max cpu_prep, and max gpu_prep+cpu_prep on the same GPU.
+    `wire_time` (GPU with the most RDMA work), three `trainer_prep_time` picks,
+    and `trainer_active_time` (GPU with the longest first-`next` to
+    `wait_transfers()` wall clock).
     """
     best_bytes = max(payloads, key=lambda payload: payload["wire_bytes"])
     best_wire = max(payloads, key=lambda payload: payload["wire_time"])
     best_gpu_prep = max(payloads, key=lambda payload: payload["gpu_prep"])
     best_cpu_prep = max(payloads, key=lambda payload: payload["cpu_prep"])
     best_total = max(payloads, key=lambda payload: payload["gpu_prep"] + payload["cpu_prep"])
+    best_active = max(payloads, key=lambda payload: payload["active_time"])
     total_gpu_prep = float(best_total["gpu_prep"])
     total_cpu_prep = float(best_total["cpu_prep"])
     return (
@@ -359,6 +403,7 @@ def format_perf_section(weight_version: int, payloads: list[dict[str, int | floa
         f"trainer_prep_time_cpu: gpu={best_cpu_prep['gpu']} time={format_prep_seconds(float(best_cpu_prep['cpu_prep']))}\n"
         f"trainer_prep_time_total: gpu={best_total['gpu']} gpu_prep={format_prep_seconds(total_gpu_prep)} "
         f"cpu_prep={format_prep_seconds(total_cpu_prep)} total={format_prep_seconds(total_gpu_prep + total_cpu_prep)}\n"
+        f"trainer_active_time: gpu={best_active['gpu']} time={format_seconds(float(best_active['active_time']))}\n"
     )
 
 
@@ -371,8 +416,8 @@ def gather_and_write_perf_log(
     """Gloo-gather every rank's payload; rank 0 appends the bottleneck GPU to the log.
 
     Non-senders send `None`. Rank 0 writes `max_num_wire_bytes_per_trainer`,
-    `wire_time`, and the three `trainer_prep_time` lines so many processes do not
-    append the same file.
+    `wire_time`, the three `trainer_prep_time` lines, and `trainer_active_time`
+    so many processes do not append the same file.
     """
     if collector is None:
         return

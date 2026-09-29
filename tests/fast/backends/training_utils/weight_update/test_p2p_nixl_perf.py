@@ -18,6 +18,7 @@ from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import 
     new_collector,
     perf_log_path,
     reset_collector,
+    stop_active_time,
     stop_gpu_prep,
     timed_call,
     wrap_gpu_prep_iter,
@@ -37,6 +38,7 @@ def _payload(
     wire_time: float = 0.0,
     gpu_prep: float = 0.0,
     cpu_prep: float = 0.0,
+    active_time: float = 0.0,
 ) -> dict[str, int | float]:
     return {
         "gpu": gpu,
@@ -46,6 +48,7 @@ def _payload(
         "wire_time": wire_time,
         "gpu_prep": gpu_prep,
         "cpu_prep": cpu_prep,
+        "active_time": active_time,
         "weight_version": weight_version,
     }
 
@@ -65,6 +68,8 @@ def _section(
     total_gpu_prep_s: str = "0.00s",
     total_cpu_prep_s: str = "0.00s",
     total_s: str = "0.00s",
+    active_gpu: int = 0,
+    active_s: str = "0.000s",
 ) -> str:
     return (
         f"=== p2p nixl perf  weight_version={weight_version} ===\n"
@@ -74,6 +79,7 @@ def _section(
         f"trainer_prep_time_cpu: gpu={cpu_prep_gpu} time={cpu_prep_s}\n"
         f"trainer_prep_time_total: gpu={total_gpu} gpu_prep={total_gpu_prep_s} "
         f"cpu_prep={total_cpu_prep_s} total={total_s}\n"
+        f"trainer_active_time: gpu={active_gpu} time={active_s}\n"
     )
 
 
@@ -100,9 +106,16 @@ class TestP2PNixlPerfHelpers:
         text = format_perf_section(
             12,
             [
-                _payload(gpu=2, wire_bytes=10, wire_time=2.110, gpu_prep=0.20, cpu_prep=0.55),
-                _payload(gpu=5, wire_bytes=int(12.40 * _GIB), wire_time=0.4, gpu_prep=0.91, cpu_prep=0.40),
-                _payload(gpu=1, wire_bytes=3, wire_time=1.0, gpu_prep=0.10, cpu_prep=0.10),
+                _payload(gpu=2, wire_bytes=10, wire_time=2.110, gpu_prep=0.20, cpu_prep=0.55, active_time=1.0),
+                _payload(
+                    gpu=5,
+                    wire_bytes=int(12.40 * _GIB),
+                    wire_time=0.4,
+                    gpu_prep=0.91,
+                    cpu_prep=0.40,
+                    active_time=3.410,
+                ),
+                _payload(gpu=1, wire_bytes=3, wire_time=1.0, gpu_prep=0.10, cpu_prep=0.10, active_time=2.0),
             ],
         )
         assert text == _section(
@@ -119,6 +132,8 @@ class TestP2PNixlPerfHelpers:
             total_gpu_prep_s="0.91s",
             total_cpu_prep_s="0.40s",
             total_s="1.31s",
+            active_gpu=5,
+            active_s="3.410s",
         )
 
     def test_prep_total_is_argmax_on_the_same_gpu_not_sum_of_category_maxes(self):
@@ -192,6 +207,23 @@ class TestP2PNixlPerfHelpers:
             next(wrapped)
         assert collector.gpu_prep() >= 0.04
 
+    def test_active_time_is_one_wall_clock_from_first_next_until_stop(self):
+        """trainer_active_time starts once on the first next() and is not a sum of outer steps."""
+        collector = new_collector(gpu=5, pp_rank=0, gathered_dp_rank=5)
+        reset_collector(collector, weight_version=1)
+        wrapped = wrap_gpu_prep_iter(collector, iter(["a", "b"]))
+        assert next(wrapped) == "a"
+        time.sleep(0.02)
+        stop_gpu_prep(collector)
+        assert next(wrapped) == "b"
+        time.sleep(0.02)
+        stop_gpu_prep(collector)
+        stop_active_time(collector)
+        assert collector.active_time() >= 0.04
+
+        reset_collector(collector, weight_version=2)
+        assert collector.active_time() == 0.0
+
     def test_wrap_gpu_prep_iter_is_identity_without_a_collector(self):
         """Mooncake has no collector; the updater wrap must not replace the iterator."""
         inner = iter([1])
@@ -222,6 +254,7 @@ class TestP2PNixlPerfHelpers:
         add_cpu_load(None, 0.1)
         add_session_cpu_setup(None, 0.1)
         stop_gpu_prep(None)
+        stop_active_time(None)
         assert begin_wire_group(None) == 0
 
     def test_log_path_prefers_miles_log_dir(self, tmp_path: Path, monkeypatch):
@@ -244,7 +277,7 @@ class TestGatherAndWritePerfLog:
         add_wire_bytes(collector, 10)
         gathered = [
             None,
-            _payload(gpu=2, wire_bytes=55, weight_version=12, wire_time=0.5, gpu_prep=0.20, cpu_prep=0.55),
+            _payload(gpu=2, wire_bytes=55, weight_version=12, wire_time=0.5, gpu_prep=0.20, cpu_prep=0.55, active_time=1.0),
             _payload(
                 gpu=5,
                 wire_bytes=int(12.40 * _GIB),
@@ -252,6 +285,7 @@ class TestGatherAndWritePerfLog:
                 wire_time=2.110,
                 gpu_prep=0.91,
                 cpu_prep=0.40,
+                active_time=3.410,
             ),
         ]
         with patch(f"{_MODULE}._gather_payloads", return_value=gathered):
@@ -270,6 +304,8 @@ class TestGatherAndWritePerfLog:
             total_gpu_prep_s="0.91s",
             total_cpu_prep_s="0.40s",
             total_s="1.31s",
+            active_gpu=5,
+            active_s="3.410s",
         )
 
     def test_a_later_transfer_appends_a_new_section(self, tmp_path: Path):
@@ -295,6 +331,8 @@ class TestGatherAndWritePerfLog:
                 bytes_gib="1.00GiB",
                 wire_gpu=1,
                 wire_s="1.000s",
+                active_gpu=1,
+                active_s="0.000s",
             )
             + _section(
                 weight_version=2,
@@ -302,6 +340,8 @@ class TestGatherAndWritePerfLog:
                 bytes_gib="2.00GiB",
                 wire_gpu=1,
                 wire_s="2.000s",
+                active_gpu=1,
+                active_s="0.000s",
             )
         )
 

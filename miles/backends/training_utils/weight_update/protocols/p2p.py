@@ -34,6 +34,7 @@ from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import 
     gather_and_write_perf_log,
     new_collector,
     reset_collector,
+    stop_active_time,
     stop_gpu_prep,
     timed_call,
     wrap_gpu_prep_iter,
@@ -92,9 +93,11 @@ class UpdateWeightP2P(WeightTransferProtocol):
     def after_base_weights(self) -> None:
         """Wait for all background P2P writes to complete."""
         if not self.is_sender:
+            stop_active_time(self._nixl_perf)
             gather_and_write_perf_log(self._nixl_perf, is_sender=False)
             return
         self.transfer_manager.wait_transfers()
+        stop_active_time(self._nixl_perf)
         assert len(self._tensor_update_pending) == 0 and len(self._staged_tensors) == 0, (
             f"Some tensors were not transferred during P2P weight update. "
             f"Pending: {self._tensor_update_pending}, Staged: {self._staged_tensors}"
@@ -117,7 +120,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
     def wrap_weight_iter(
         self, buckets: Iterator[list[tuple[str, torch.Tensor]]]
     ) -> Iterator[list[tuple[str, torch.Tensor]]]:
-        """Start gpu-prep at each `next()`; mooncake returns `buckets` unchanged."""
+        """Start gpu-prep at each `next()` and active time on the first `next()`; mooncake is identity."""
         return wrap_gpu_prep_iter(self._nixl_perf, buckets)
 
     def send_bucket(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> None:
