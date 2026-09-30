@@ -183,3 +183,57 @@ trainer_prep_time_total: gpu=5 gpu_prep=0.91s cpu_prep=0.40s total=1.31s
 trainer_active_time: gpu=5 time=3.410s
 ```
 
+---
+
+## Clock start and stop
+
+X-axis is pipeline order, not measured seconds. A bar is one
+`time.monotonic()` interval. `max_num_wire_bytes_per_trainer` is not a
+clock; it is sampled during pointer setup (`sum(source_lens)`).
+
+### One `send_bucket`
+
+Pipeline on this plot: all-gather, HF convert, quant, staging,
+`load_weights`, pointer setup, `_do_nixl_write`. Staging is still gpu-prep
+(`_get_transfer_ready_params` in `send_bucket`). Extra CPU replicas on this
+GPU repeat load → setup → RDMA after the first replica; the plot shows one
+replica after gpu-prep.
+
+![Clock start and stop on one send_bucket](clock-send-bucket.svg)
+
+`trainer_active_time` starts at the first `next(iterator)` of this
+`update_weights` and does **not** stop at the end of this bucket.
+
+`trainer_prep_time` gpu starts at that `next(iterator)` (all-gather + HF
+convert + quant run inside the yield) and stops at `stop_gpu_prep()`, after
+staging, right before `load_weights`.
+
+`trainer_prep_time` cpu is **two** clocks, not one continuous interval:
+
+- `load_weights`: copy ready HF tensors into the shared pinned CPU replica.
+  That is the actual CPU loading.
+- pointer setup in `_do_p2p_write_one_session`: walk names, collect CPU and
+  remote pointers, `add_wire_bytes`. Not a tensor copy. Stops at
+  `cpu_setup.stop()`, immediately before `_do_nixl_write`.
+
+`wire_time` starts immediately before `_do_nixl_write` and stops when that
+call returns (including the DONE poll).
+
+### One full `update_weights`
+
+Two outer `send_bucket` steps, then `wait_transfers()`. gpu-prep, cpu-prep,
+and `wire_time` are disjoint bars that the log **sums**. `trainer_active_time`
+is one wall clock around them, including the gaps.
+
+![Clock start and stop on one full update_weights](clock-update-weights.svg)
+
+On this plot, **load** is `load_weights` and **setup** is pointer setup.
+Together they are `trainer_prep_time` cpu. RDMA is `wire_time`, not cpu-prep.
+
+`trainer_active_time` starts at the first `next(iterator)` and stops in
+`after_base_weights` after `wait_transfers()`. Last-replica writes can still
+be in flight until that wait.
+
+Parallel sessions of one replica each start and stop their own setup and
+`wire_time` clocks; the replica keeps the longest, not the sum.
+
