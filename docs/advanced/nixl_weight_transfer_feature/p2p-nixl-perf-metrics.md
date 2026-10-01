@@ -94,10 +94,27 @@ the residual).
 - **gather** — start before `_materialize_non_expert_batch` /
   `_materialize_expert_batch` (raw) or each `next()` of
   `export_hf_weights` (bridge); stop when that call returns.
-  Includes: copy this rank's shards onto the GPU (or allocate receive
-  buffers) and `cuda.synchronize`; PP broadcast when PP is gathered;
-  TP all-gather (dense) or ETP all-gather (routed experts) plus concat /
-  strided rechunk; EP name exchange and EP all-gather for routed experts.
+  Raw path also prints load / PP / TP / EP chunks **inside** that wall clock,
+  from the same total GPU (not independent argmax). They need not add up to
+  `gather` (`_set_tp_attrs` stays in the residual). Bridge has no inner
+  hooks (`export_hf_weights` is one `next()`), so those inner lines are
+  `0.00s`.
+  - **gather_load** — `_load_or_allocate_params`: copy this rank's shards
+    onto the GPU (or allocate receive buffers) and `cuda.synchronize`.
+  - **gather_pp** — `_broadcast_across_pp` when PP is gathered; skipped
+    (stays `0.00s`) when `gather_pp` is false.
+  - **gather_tp** — `all_gather_params_async`: TP all-gather (dense) or
+    ETP all-gather (routed experts). Also prints three sequential chunks
+    **inside** that call, from the same total GPU. They need not add up
+    to `gather_tp`.
+    - **gather_tp_start** — allocate receive buffers and launch
+      `dist.all_gather(..., async_op=True)` for every param.
+    - **gather_tp_wait** — wait those NCCL handles (overlap is inside
+      this wait, not across other gather steps).
+    - **gather_tp_concat** — concat partitions and GLU / MoE rechunk.
+  - **gather_ep** — `dist.all_gather_object` (EP names) plus each EP
+    `dist.all_gather` and the wait of those handles. Near-zero when
+    `ep.size == 1`.
   Bridge: AutoBridge `export_hf_weights` (TP/EP collectives and its HF
   convert live in that `next()`).
 - **convert** — start before `convert_to_hf` (raw) or the body of
@@ -124,7 +141,8 @@ sessions of the same replica can run in parallel: count that group **once**
 
 **What you see in the log:** Three lines: GPU with max gpu-prep, GPU with max
 cpu-prep, GPU with max `gpu_prep + cpu_prep` (same GPU). Then that last
-GPU's gather / convert / stage split.
+GPU's gather / convert / stage split. Gather also prints load / PP / TP /
+EP from that same GPU, and TP also prints start / wait / concat.
 
 ---
 
@@ -175,21 +193,32 @@ Aggregation (full transfer = one log section):
 | `wire_time` | timer around `_do_nixl_write` | **max** (count once) | sum | sum | GPU with max work |
 | `trainer_prep_time` gpu | `next(iterator)` until before `load_weights` | n/a (outer, main thread) | n/a | sum | GPU with max gpu_prep |
 | `trainer_prep_time` gpu gather | `_materialize_*` / bridge `export_hf_weights` `next()` | n/a | n/a | sum | that GPU's gather |
+| `trainer_prep_time` gpu gather_load | `_load_or_allocate_params` | n/a | n/a | sum | that GPU's load |
+| `trainer_prep_time` gpu gather_pp | `_broadcast_across_pp` | n/a | n/a | sum | that GPU's PP |
+| `trainer_prep_time` gpu gather_tp | `all_gather_params_async` (TP or ETP) | n/a | n/a | sum | that GPU's TP |
+| `trainer_prep_time` gpu gather_tp_start | launch `dist.all_gather` | n/a | n/a | sum | that GPU's TP start |
+| `trainer_prep_time` gpu gather_tp_wait | wait NCCL handles | n/a | n/a | sum | that GPU's TP wait |
+| `trainer_prep_time` gpu gather_tp_concat | concat / GLU rechunk | n/a | n/a | sum | that GPU's TP concat |
+| `trainer_prep_time` gpu gather_ep | EP `all_gather_object` + `all_gather` + wait | n/a | n/a | sum | that GPU's EP |
 | `trainer_prep_time` gpu convert | `convert_to_hf` / `_postprocess_and_quantize` | n/a | n/a | sum | that GPU's convert |
 | `trainer_prep_time` gpu stage | `_get_transfer_ready_params` | n/a | n/a | sum | that GPU's stage |
 | `trainer_prep_time` cpu | `load_weights` + setup until before `_do_nixl_write` | **max** on setup | **sum** (`load_weights`) | sum | GPU with max cpu_prep |
 | `trainer_active_time` | first `next(iterator)` → `wait_transfers()` done | n/a | n/a | n/a (one wall clock) | GPU with max active |
 
 Each sender payload carries that rank’s `gpu_prep`, `cpu_prep`, `gpu_gather`,
+`gpu_gather_load`, `gpu_gather_pp`, `gpu_gather_tp`, `gpu_gather_tp_start`,
+`gpu_gather_tp_wait`, `gpu_gather_tp_concat`, `gpu_gather_ep`,
 `gpu_convert`, and `gpu_stage`. Rank 0 prints three prep picks:
 
 - `argmax(gpu_prep)`
 - `argmax(cpu_prep)`
 - `argmax(gpu_prep + cpu_prep)` on **that same GPU**, then **that GPU's**
-  gather / convert / stage
+  gather / convert / stage (and gather's load / PP / TP / EP, and TP's
+  start / wait / concat)
 
 Do not define the third number as `max(gpu_prep) + max(cpu_prep)` across
-different GPUs. Do not `argmax` gather, convert, or stage on their own.
+different GPUs. Do not `argmax` gather, convert, stage, or gather chunks
+on their own.
 
 Hook sites:
 
@@ -198,7 +227,10 @@ Hook sites:
   not import NIXL).
 - iterator: time `_materialize_*` as gather, `convert_to_hf` as convert
   (bridge: `export_hf_weights` `next()` as gather,
-  `_postprocess_and_quantize` as convert).
+  `_postprocess_and_quantize` as convert). Raw `_materialize_*` also times
+  `_load_or_allocate_params`, `_broadcast_across_pp`,
+  `all_gather_params_async` (and its start / wait / concat), and EP
+  `all_gather_object` / `all_gather` / wait.
 - `p2p.py` `send_bucket`: time `_get_transfer_ready_params` as stage; time
   `load_weights` per replica as prep cpu.
 - `p2p.py` `_do_p2p_write_one_session`: add bytes; cpu-prep continues until
@@ -218,6 +250,13 @@ trainer_prep_time_gpu: gpu=5 time=0.91s
 trainer_prep_time_cpu: gpu=2 time=0.55s
 trainer_prep_time_total: gpu=5 gpu_prep=0.91s cpu_prep=0.40s total=1.31s
 trainer_prep_time_gpu_gather: gpu=5 time=0.50s
+trainer_prep_time_gpu_gather_load: gpu=5 time=0.04s
+trainer_prep_time_gpu_gather_pp: gpu=5 time=0.00s
+trainer_prep_time_gpu_gather_tp: gpu=5 time=0.41s
+trainer_prep_time_gpu_gather_tp_start: gpu=5 time=0.02s
+trainer_prep_time_gpu_gather_tp_wait: gpu=5 time=0.35s
+trainer_prep_time_gpu_gather_tp_concat: gpu=5 time=0.04s
+trainer_prep_time_gpu_gather_ep: gpu=5 time=0.04s
 trainer_prep_time_gpu_convert: gpu=5 time=0.30s
 trainer_prep_time_gpu_stage: gpu=5 time=0.01s
 trainer_active_time: gpu=5 time=3.410s

@@ -13,6 +13,13 @@ from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
     GPU_PREP_CONVERT,
     GPU_PREP_GATHER,
+    GPU_PREP_GATHER_EP,
+    GPU_PREP_GATHER_LOAD,
+    GPU_PREP_GATHER_PP,
+    GPU_PREP_GATHER_TP,
+    GPU_PREP_GATHER_TP_CONCAT,
+    GPU_PREP_GATHER_TP_START,
+    GPU_PREP_GATHER_TP_WAIT,
     timed_gpu_prep_part,
 )
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
@@ -141,11 +148,13 @@ def _materialize_non_expert_batch(
 ) -> list[tuple[str, torch.Tensor]]:
     """Load -> PP broadcast (when gather_pp) -> TP all_gather."""
     monkey_patch_torch_reductions()
-    params = _load_or_allocate_params(param_infos, megatron_local_weights)
+    params = timed_gpu_prep_part(GPU_PREP_GATHER_LOAD, _load_or_allocate_params, param_infos, megatron_local_weights)
     if gather_pp:
-        _broadcast_across_pp(param_infos, params)
+        timed_gpu_prep_part(GPU_PREP_GATHER_PP, _broadcast_across_pp, param_infos, params)
     _set_tp_attrs(param_infos, params)
-    gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
+    gathered = timed_gpu_prep_part(
+        GPU_PREP_GATHER_TP, all_gather_params_async, args, list(zip(param_infos, params, strict=True))
+    )
     return [(info.name, param) for info, param in zip(param_infos, gathered, strict=True)]
 
 
@@ -162,11 +171,13 @@ def _materialize_expert_batch(
     symmetric EP all_gather with a name exchange.
     """
     monkey_patch_torch_reductions()
-    params = _load_or_allocate_params(param_infos, megatron_local_weights)
+    params = timed_gpu_prep_part(GPU_PREP_GATHER_LOAD, _load_or_allocate_params, param_infos, megatron_local_weights)
     if gather_pp:
-        _broadcast_across_pp(param_infos, params)
+        timed_gpu_prep_part(GPU_PREP_GATHER_PP, _broadcast_across_pp, param_infos, params)
     _set_tp_attrs(param_infos, params)
-    etp_gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
+    etp_gathered = timed_gpu_prep_part(
+        GPU_PREP_GATHER_TP, all_gather_params_async, args, list(zip(param_infos, params, strict=True))
+    )
 
     ep = get_parallel_state().ep
     if ep.size == 1:
@@ -174,7 +185,7 @@ def _materialize_expert_batch(
 
     names = [info.name for info in param_infos]
     all_names: list = [None] * ep.size
-    dist.all_gather_object(all_names, names, group=ep.group)
+    timed_gpu_prep_part(GPU_PREP_GATHER_EP, dist.all_gather_object, all_names, names, group=ep.group)
     for ep_names in all_names:
         assert len(ep_names) == len(
             names
@@ -188,7 +199,7 @@ def _materialize_expert_batch(
         for ep_rank, ep_names in enumerate(all_names):
             all_gathered[ep_rank].append((ep_names[i], buffers[ep_rank]))
     for handle in handles:
-        handle.wait()
+        timed_gpu_prep_part(GPU_PREP_GATHER_EP, handle.wait)
 
     return [named for per_rank in all_gathered for named in per_rank]
 
@@ -382,7 +393,14 @@ def all_gather_params_async(
                 continue
 
             param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
-            handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
+            handle = timed_gpu_prep_part(
+                GPU_PREP_GATHER_TP_START,
+                dist.all_gather,
+                param_partitions,
+                param.data,
+                group=tp_group,
+                async_op=True,
+            )
             gather_tasks.append((info, None, handle, param_partitions, param.partition_dim, param.partition_stride))
             handles.append(handle)
 
@@ -390,7 +408,7 @@ def all_gather_params_async(
     # This ensures maximum parallelism by not blocking on individual operations
     for handle in handles:
         if handle is not None:
-            handle.wait()
+            timed_gpu_prep_part(GPU_PREP_GATHER_TP_WAIT, handle.wait)
 
     # Phase 3: Process all results after all communications are done
     gathered_params = []
@@ -402,7 +420,9 @@ def all_gather_params_async(
             partition_stride, partition_dim = _check_and_fix_partition(
                 args, info.name, partition_stride, partition_dim
             )
-            param = _gather_with_stride(param_partitions, partition_dim, partition_stride)
+            param = timed_gpu_prep_part(
+                GPU_PREP_GATHER_TP_CONCAT, _gather_with_stride, param_partitions, partition_dim, partition_stride
+            )
 
         gathered_params.append(param)
 

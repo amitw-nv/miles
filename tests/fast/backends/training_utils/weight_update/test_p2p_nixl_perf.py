@@ -7,6 +7,13 @@ import pytest
 from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
     GPU_PREP_CONVERT,
     GPU_PREP_GATHER,
+    GPU_PREP_GATHER_EP,
+    GPU_PREP_GATHER_LOAD,
+    GPU_PREP_GATHER_PP,
+    GPU_PREP_GATHER_TP,
+    GPU_PREP_GATHER_TP_CONCAT,
+    GPU_PREP_GATHER_TP_START,
+    GPU_PREP_GATHER_TP_WAIT,
     GPU_PREP_STAGE,
     add_cpu_load,
     add_gpu_prep_part,
@@ -43,6 +50,13 @@ def _payload(
     wire_time: float = 0.0,
     gpu_prep: float = 0.0,
     gpu_gather: float = 0.0,
+    gpu_gather_load: float = 0.0,
+    gpu_gather_pp: float = 0.0,
+    gpu_gather_tp: float = 0.0,
+    gpu_gather_tp_start: float = 0.0,
+    gpu_gather_tp_wait: float = 0.0,
+    gpu_gather_tp_concat: float = 0.0,
+    gpu_gather_ep: float = 0.0,
     gpu_convert: float = 0.0,
     gpu_stage: float = 0.0,
     cpu_prep: float = 0.0,
@@ -56,6 +70,13 @@ def _payload(
         "wire_time": wire_time,
         "gpu_prep": gpu_prep,
         "gpu_gather": gpu_gather,
+        "gpu_gather_load": gpu_gather_load,
+        "gpu_gather_pp": gpu_gather_pp,
+        "gpu_gather_tp": gpu_gather_tp,
+        "gpu_gather_tp_start": gpu_gather_tp_start,
+        "gpu_gather_tp_wait": gpu_gather_tp_wait,
+        "gpu_gather_tp_concat": gpu_gather_tp_concat,
+        "gpu_gather_ep": gpu_gather_ep,
         "gpu_convert": gpu_convert,
         "gpu_stage": gpu_stage,
         "cpu_prep": cpu_prep,
@@ -80,6 +101,13 @@ def _section(
     total_cpu_prep_s: str = "0.00s",
     total_s: str = "0.00s",
     gather_s: str = "0.00s",
+    gather_load_s: str = "0.00s",
+    gather_pp_s: str = "0.00s",
+    gather_tp_s: str = "0.00s",
+    gather_tp_start_s: str = "0.00s",
+    gather_tp_wait_s: str = "0.00s",
+    gather_tp_concat_s: str = "0.00s",
+    gather_ep_s: str = "0.00s",
     convert_s: str = "0.00s",
     stage_s: str = "0.00s",
     active_gpu: int = 0,
@@ -94,6 +122,13 @@ def _section(
         f"trainer_prep_time_total: gpu={total_gpu} gpu_prep={total_gpu_prep_s} "
         f"cpu_prep={total_cpu_prep_s} total={total_s}\n"
         f"trainer_prep_time_gpu_gather: gpu={total_gpu} time={gather_s}\n"
+        f"trainer_prep_time_gpu_gather_load: gpu={total_gpu} time={gather_load_s}\n"
+        f"trainer_prep_time_gpu_gather_pp: gpu={total_gpu} time={gather_pp_s}\n"
+        f"trainer_prep_time_gpu_gather_tp: gpu={total_gpu} time={gather_tp_s}\n"
+        f"trainer_prep_time_gpu_gather_tp_start: gpu={total_gpu} time={gather_tp_start_s}\n"
+        f"trainer_prep_time_gpu_gather_tp_wait: gpu={total_gpu} time={gather_tp_wait_s}\n"
+        f"trainer_prep_time_gpu_gather_tp_concat: gpu={total_gpu} time={gather_tp_concat_s}\n"
+        f"trainer_prep_time_gpu_gather_ep: gpu={total_gpu} time={gather_ep_s}\n"
         f"trainer_prep_time_gpu_convert: gpu={total_gpu} time={convert_s}\n"
         f"trainer_prep_time_gpu_stage: gpu={total_gpu} time={stage_s}\n"
         f"trainer_active_time: gpu={active_gpu} time={active_s}\n"
@@ -135,6 +170,13 @@ class TestP2PNixlPerfHelpers:
                     wire_time=0.4,
                     gpu_prep=0.91,
                     gpu_gather=0.50,
+                    gpu_gather_load=0.04,
+                    gpu_gather_pp=0.00,
+                    gpu_gather_tp=0.41,
+                    gpu_gather_tp_start=0.02,
+                    gpu_gather_tp_wait=0.35,
+                    gpu_gather_tp_concat=0.04,
+                    gpu_gather_ep=0.04,
                     gpu_convert=0.30,
                     gpu_stage=0.01,
                     cpu_prep=0.40,
@@ -158,6 +200,13 @@ class TestP2PNixlPerfHelpers:
             total_cpu_prep_s="0.40s",
             total_s="1.31s",
             gather_s="0.50s",
+            gather_load_s="0.04s",
+            gather_pp_s="0.00s",
+            gather_tp_s="0.41s",
+            gather_tp_start_s="0.02s",
+            gather_tp_wait_s="0.35s",
+            gather_tp_concat_s="0.04s",
+            gather_ep_s="0.04s",
             convert_s="0.30s",
             stage_s="0.01s",
             active_gpu=5,
@@ -187,6 +236,8 @@ class TestP2PNixlPerfHelpers:
                     gpu_prep=0.20,
                     cpu_prep=0.55,
                     gpu_gather=0.90,
+                    gpu_gather_tp=0.80,
+                    gpu_gather_tp_wait=0.70,
                     gpu_convert=0.05,
                     gpu_stage=0.20,
                 ),
@@ -196,16 +247,31 @@ class TestP2PNixlPerfHelpers:
                     gpu_prep=0.91,
                     cpu_prep=0.40,
                     gpu_gather=0.50,
+                    gpu_gather_load=0.04,
+                    gpu_gather_pp=0.00,
+                    gpu_gather_tp=0.41,
+                    gpu_gather_tp_start=0.02,
+                    gpu_gather_tp_wait=0.35,
+                    gpu_gather_tp_concat=0.04,
+                    gpu_gather_ep=0.04,
                     gpu_convert=0.30,
                     gpu_stage=0.01,
                 ),
             ],
         )
         assert "trainer_prep_time_gpu_gather: gpu=5 time=0.50s" in text
+        assert "trainer_prep_time_gpu_gather_load: gpu=5 time=0.04s" in text
+        assert "trainer_prep_time_gpu_gather_tp: gpu=5 time=0.41s" in text
+        assert "trainer_prep_time_gpu_gather_tp_start: gpu=5 time=0.02s" in text
+        assert "trainer_prep_time_gpu_gather_tp_wait: gpu=5 time=0.35s" in text
+        assert "trainer_prep_time_gpu_gather_tp_concat: gpu=5 time=0.04s" in text
+        assert "trainer_prep_time_gpu_gather_ep: gpu=5 time=0.04s" in text
         assert "trainer_prep_time_gpu_convert: gpu=5 time=0.30s" in text
         assert "trainer_prep_time_gpu_stage: gpu=5 time=0.01s" in text
         assert "gpu_gather: gpu=2" not in text
         assert "time=0.90s" not in text
+        assert "time=0.80s" not in text
+        assert "time=0.70s" not in text
 
     def test_gpu_prep_parts_sum_and_reset_with_the_collector(self):
         """Each GPU sums every gather/convert/stage call; the next update_weights drops them."""
@@ -213,16 +279,40 @@ class TestP2PNixlPerfHelpers:
         reset_collector(collector, weight_version=1)
         collector.add_gpu_prep_part(GPU_PREP_GATHER, 0.10)
         collector.add_gpu_prep_part(GPU_PREP_GATHER, 0.20)
+        collector.add_gpu_prep_part(GPU_PREP_GATHER_LOAD, 0.04)
+        collector.add_gpu_prep_part(GPU_PREP_GATHER_PP, 0.01)
+        collector.add_gpu_prep_part(GPU_PREP_GATHER_TP, 0.20)
+        collector.add_gpu_prep_part(GPU_PREP_GATHER_TP_START, 0.02)
+        collector.add_gpu_prep_part(GPU_PREP_GATHER_TP_WAIT, 0.15)
+        collector.add_gpu_prep_part(GPU_PREP_GATHER_TP_CONCAT, 0.03)
+        collector.add_gpu_prep_part(GPU_PREP_GATHER_EP, 0.03)
         collector.add_gpu_prep_part(GPU_PREP_CONVERT, 0.05)
         collector.add_gpu_prep_part(GPU_PREP_STAGE, 0.01)
         assert collector.gpu_gather() == pytest.approx(0.30)
+        assert collector.payload()["gpu_gather_load"] == pytest.approx(0.04)
+        assert collector.payload()["gpu_gather_pp"] == pytest.approx(0.01)
+        assert collector.payload()["gpu_gather_tp"] == pytest.approx(0.20)
+        assert collector.payload()["gpu_gather_tp_start"] == pytest.approx(0.02)
+        assert collector.payload()["gpu_gather_tp_wait"] == pytest.approx(0.15)
+        assert collector.payload()["gpu_gather_tp_concat"] == pytest.approx(0.03)
+        assert collector.payload()["gpu_gather_ep"] == pytest.approx(0.03)
         assert collector.gpu_convert() == pytest.approx(0.05)
         assert collector.gpu_stage() == pytest.approx(0.01)
 
         reset_collector(collector, weight_version=2)
         assert collector.gpu_gather() == 0.0
+        assert collector.payload()["gpu_gather_tp"] == 0.0
+        assert collector.payload()["gpu_gather_tp_wait"] == 0.0
         assert collector.gpu_convert() == 0.0
         assert collector.gpu_stage() == 0.0
+        reset_collector(None, weight_version=0)
+
+    def test_unknown_gpu_prep_part_is_rejected(self):
+        """A typo in a gather chunk name must not silently disappear."""
+        collector = new_collector(gpu=1, pp_rank=0, gathered_dp_rank=1)
+        reset_collector(collector, weight_version=1)
+        with pytest.raises(ValueError, match="unknown gpu_prep part"):
+            collector.add_gpu_prep_part("nope", 0.1)
         reset_collector(None, weight_version=0)
 
     def test_timed_gpu_prep_part_binds_through_reset_collector(self):
@@ -381,6 +471,13 @@ class TestGatherAndWritePerfLog:
                 wire_time=2.110,
                 gpu_prep=0.91,
                 gpu_gather=0.50,
+                gpu_gather_load=0.04,
+                gpu_gather_pp=0.00,
+                gpu_gather_tp=0.41,
+                gpu_gather_tp_start=0.02,
+                gpu_gather_tp_wait=0.35,
+                gpu_gather_tp_concat=0.04,
+                gpu_gather_ep=0.04,
                 gpu_convert=0.30,
                 gpu_stage=0.01,
                 cpu_prep=0.40,
@@ -404,6 +501,13 @@ class TestGatherAndWritePerfLog:
             total_cpu_prep_s="0.40s",
             total_s="1.31s",
             gather_s="0.50s",
+            gather_load_s="0.04s",
+            gather_pp_s="0.00s",
+            gather_tp_s="0.41s",
+            gather_tp_start_s="0.02s",
+            gather_tp_wait_s="0.35s",
+            gather_tp_concat_s="0.04s",
+            gather_ep_s="0.04s",
             convert_s="0.30s",
             stage_s="0.01s",
             active_gpu=5,
