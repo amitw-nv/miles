@@ -24,6 +24,7 @@ from miles.backends.training_utils.parallel import ParallelState
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
 from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
+    GPU_PREP_STAGE,
     TimeMonitor,
     add_cpu_load,
     add_session_cpu_setup,
@@ -37,6 +38,7 @@ from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import 
     stop_active_time,
     stop_gpu_prep,
     timed_call,
+    timed_gpu_prep_part,
     wrap_gpu_prep_iter,
 )
 from miles.utils.distributed_utils import get_gloo_group
@@ -135,7 +137,9 @@ class UpdateWeightP2P(WeightTransferProtocol):
             stop_gpu_prep(self._nixl_perf)
             return
         # `ready_hf_tensors`` here are the complete tensors ready to be transferred.
-        transfer_ready_params, ready_hf_tensors = self._get_transfer_ready_params(converted_named_tensors)
+        transfer_ready_params, ready_hf_tensors = timed_gpu_prep_part(
+            GPU_PREP_STAGE, self._get_transfer_ready_params, converted_named_tensors
+        )
         stop_gpu_prep(self._nixl_perf)
 
         if transfer_ready_params and ready_hf_tensors:

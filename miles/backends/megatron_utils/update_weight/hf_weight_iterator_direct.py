@@ -10,6 +10,11 @@ from miles.backends.megatron_utils.update_weight.hf_weight_iterator import (
     _iter_mm_tower_units,
 )
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
+    GPU_PREP_CONVERT,
+    GPU_PREP_GATHER,
+    timed_gpu_prep_part,
+)
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.types import ParamInfo
@@ -42,16 +47,26 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
             desc="Update weights",
         )
         for param_infos in self._non_expert_batches:
-            named_params = _materialize_non_expert_batch(
-                self.args, param_infos, weights, gather_pp=self.placement.gather_pp
+            named_params = timed_gpu_prep_part(
+                GPU_PREP_GATHER,
+                _materialize_non_expert_batch,
+                self.args,
+                param_infos,
+                weights,
+                gather_pp=self.placement.gather_pp,
             )
             if materialize:
                 yield from self._convert_to_hf_param_units(named_params)
             del named_params
             pbar.update(1)
         for param_infos in self._expert_batches:
-            named_params = _materialize_expert_batch(
-                self.args, param_infos, weights, gather_pp=self.placement.gather_pp
+            named_params = timed_gpu_prep_part(
+                GPU_PREP_GATHER,
+                _materialize_expert_batch,
+                self.args,
+                param_infos,
+                weights,
+                gather_pp=self.placement.gather_pp,
             )
             if materialize:
                 yield from self._convert_to_hf_param_units(named_params)
@@ -68,7 +83,17 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
 
     def _convert_to_hf_param_units(self, named_params: Sequence[tuple[str, torch.Tensor]]):
         for name, param in named_params:
-            yield list(convert_to_hf(self.args, self.model_name, name, param, self.quantization_config))
+            yield list(
+                timed_gpu_prep_part(
+                    GPU_PREP_CONVERT,
+                    convert_to_hf,
+                    self.args,
+                    self.model_name,
+                    name,
+                    param,
+                    self.quantization_config,
+                )
+            )
 
 
 def _load_or_allocate_params(param_infos: Sequence[ParamInfo], megatron_local_weights) -> list[torch.Tensor]:

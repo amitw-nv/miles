@@ -5,7 +5,11 @@ from unittest.mock import patch
 import pytest
 
 from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
+    GPU_PREP_CONVERT,
+    GPU_PREP_GATHER,
+    GPU_PREP_STAGE,
     add_cpu_load,
+    add_gpu_prep_part,
     add_session_cpu_setup,
     add_session_wire_time,
     add_wire_bytes,
@@ -21,6 +25,7 @@ from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import 
     stop_active_time,
     stop_gpu_prep,
     timed_call,
+    timed_gpu_prep_part,
     wrap_gpu_prep_iter,
 )
 
@@ -37,6 +42,9 @@ def _payload(
     gathered_dp_rank: int | None = None,
     wire_time: float = 0.0,
     gpu_prep: float = 0.0,
+    gpu_gather: float = 0.0,
+    gpu_convert: float = 0.0,
+    gpu_stage: float = 0.0,
     cpu_prep: float = 0.0,
     active_time: float = 0.0,
 ) -> dict[str, int | float]:
@@ -47,6 +55,9 @@ def _payload(
         "wire_bytes": wire_bytes,
         "wire_time": wire_time,
         "gpu_prep": gpu_prep,
+        "gpu_gather": gpu_gather,
+        "gpu_convert": gpu_convert,
+        "gpu_stage": gpu_stage,
         "cpu_prep": cpu_prep,
         "active_time": active_time,
         "weight_version": weight_version,
@@ -68,6 +79,9 @@ def _section(
     total_gpu_prep_s: str = "0.00s",
     total_cpu_prep_s: str = "0.00s",
     total_s: str = "0.00s",
+    gather_s: str = "0.00s",
+    convert_s: str = "0.00s",
+    stage_s: str = "0.00s",
     active_gpu: int = 0,
     active_s: str = "0.000s",
 ) -> str:
@@ -79,6 +93,9 @@ def _section(
         f"trainer_prep_time_cpu: gpu={cpu_prep_gpu} time={cpu_prep_s}\n"
         f"trainer_prep_time_total: gpu={total_gpu} gpu_prep={total_gpu_prep_s} "
         f"cpu_prep={total_cpu_prep_s} total={total_s}\n"
+        f"trainer_prep_time_gpu_gather: gpu={total_gpu} time={gather_s}\n"
+        f"trainer_prep_time_gpu_convert: gpu={total_gpu} time={convert_s}\n"
+        f"trainer_prep_time_gpu_stage: gpu={total_gpu} time={stage_s}\n"
         f"trainer_active_time: gpu={active_gpu} time={active_s}\n"
     )
 
@@ -117,6 +134,9 @@ class TestP2PNixlPerfHelpers:
                     wire_bytes=int(13.31 * _GB),
                     wire_time=0.4,
                     gpu_prep=0.91,
+                    gpu_gather=0.50,
+                    gpu_convert=0.30,
+                    gpu_stage=0.01,
                     cpu_prep=0.40,
                     active_time=3.410,
                 ),
@@ -137,6 +157,9 @@ class TestP2PNixlPerfHelpers:
             total_gpu_prep_s="0.91s",
             total_cpu_prep_s="0.40s",
             total_s="1.31s",
+            gather_s="0.50s",
+            convert_s="0.30s",
+            stage_s="0.01s",
             active_gpu=5,
             active_s="3.410s",
         )
@@ -152,6 +175,74 @@ class TestP2PNixlPerfHelpers:
         )
         assert "trainer_prep_time_total: gpu=5 gpu_prep=0.91s cpu_prep=0.40s total=1.31s" in text
         assert "total=1.46s" not in text
+
+    def test_gpu_prep_parts_come_from_the_total_gpu_not_independent_maxes(self):
+        """Print gather/convert/stage from argmax(gpu_prep+cpu_prep), even if another GPU has a larger part."""
+        text = format_perf_section(
+            1,
+            [
+                _payload(
+                    gpu=2,
+                    wire_bytes=1,
+                    gpu_prep=0.20,
+                    cpu_prep=0.55,
+                    gpu_gather=0.90,
+                    gpu_convert=0.05,
+                    gpu_stage=0.20,
+                ),
+                _payload(
+                    gpu=5,
+                    wire_bytes=1,
+                    gpu_prep=0.91,
+                    cpu_prep=0.40,
+                    gpu_gather=0.50,
+                    gpu_convert=0.30,
+                    gpu_stage=0.01,
+                ),
+            ],
+        )
+        assert "trainer_prep_time_gpu_gather: gpu=5 time=0.50s" in text
+        assert "trainer_prep_time_gpu_convert: gpu=5 time=0.30s" in text
+        assert "trainer_prep_time_gpu_stage: gpu=5 time=0.01s" in text
+        assert "gpu_gather: gpu=2" not in text
+        assert "time=0.90s" not in text
+
+    def test_gpu_prep_parts_sum_and_reset_with_the_collector(self):
+        """Each GPU sums every gather/convert/stage call; the next update_weights drops them."""
+        collector = new_collector(gpu=5, pp_rank=0, gathered_dp_rank=5)
+        reset_collector(collector, weight_version=1)
+        collector.add_gpu_prep_part(GPU_PREP_GATHER, 0.10)
+        collector.add_gpu_prep_part(GPU_PREP_GATHER, 0.20)
+        collector.add_gpu_prep_part(GPU_PREP_CONVERT, 0.05)
+        collector.add_gpu_prep_part(GPU_PREP_STAGE, 0.01)
+        assert collector.gpu_gather() == pytest.approx(0.30)
+        assert collector.gpu_convert() == pytest.approx(0.05)
+        assert collector.gpu_stage() == pytest.approx(0.01)
+
+        reset_collector(collector, weight_version=2)
+        assert collector.gpu_gather() == 0.0
+        assert collector.gpu_convert() == 0.0
+        assert collector.gpu_stage() == 0.0
+        reset_collector(None, weight_version=0)
+
+    def test_timed_gpu_prep_part_binds_through_reset_collector(self):
+        """Iterator hooks call timed_gpu_prep_part; reset_collector must attach the collector."""
+        collector = new_collector(gpu=1, pp_rank=0, gathered_dp_rank=1)
+        reset_collector(collector, weight_version=1)
+
+        def _sleep() -> str:
+            time.sleep(0.02)
+            return "ok"
+
+        assert timed_gpu_prep_part(GPU_PREP_CONVERT, _sleep) == "ok"
+        assert collector.gpu_convert() >= 0.02
+        reset_collector(None, weight_version=0)
+
+    def test_timed_gpu_prep_part_is_noop_without_a_collector(self):
+        """Mooncake / unbound iterator must still run the function."""
+        reset_collector(None, weight_version=1)
+        assert timed_gpu_prep_part(GPU_PREP_GATHER, lambda: 7) == 7
+        add_gpu_prep_part(GPU_PREP_STAGE, 1.0)
 
     def test_session_bytes_sum_and_reset_drops_the_previous_transfer(self):
         """Inner sessions and outer send_bucket steps add; the next update_weights must not inherit them."""
@@ -289,6 +380,9 @@ class TestGatherAndWritePerfLog:
                 weight_version=12,
                 wire_time=2.110,
                 gpu_prep=0.91,
+                gpu_gather=0.50,
+                gpu_convert=0.30,
+                gpu_stage=0.01,
                 cpu_prep=0.40,
                 active_time=3.410,
             ),
@@ -309,6 +403,9 @@ class TestGatherAndWritePerfLog:
             total_gpu_prep_s="0.91s",
             total_cpu_prep_s="0.40s",
             total_s="1.31s",
+            gather_s="0.50s",
+            convert_s="0.30s",
+            stage_s="0.01s",
             active_gpu=5,
             active_s="3.410s",
         )

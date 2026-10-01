@@ -84,6 +84,34 @@ ready to load to CPU.
 **How we measure it:** Outer: start at `next(iterator)`, stop right before
 `load_weights`. Sum every outer step of this full transfer, per GPU.
 
+**gpu_prep parts.** Three extra counters inside that wall clock. Each
+sender GPU **sums** that part over this full transfer. Rank 0 does **not**
+pick a max GPU per part. It prints the three numbers from the same GPU as
+`trainer_prep_time_total` (`argmax(gpu_prep + cpu_prep)` on one GPU). They
+need not add up to that GPU's `gpu_prep` (packing, tqdm, checksums stay in
+the residual).
+
+- **gather** — start before `_materialize_non_expert_batch` /
+  `_materialize_expert_batch` (raw) or each `next()` of
+  `export_hf_weights` (bridge); stop when that call returns.
+  Includes: copy this rank's shards onto the GPU (or allocate receive
+  buffers) and `cuda.synchronize`; PP broadcast when PP is gathered;
+  TP all-gather (dense) or ETP all-gather (routed experts) plus concat /
+  strided rechunk; EP name exchange and EP all-gather for routed experts.
+  Bridge: AutoBridge `export_hf_weights` (TP/EP collectives and its HF
+  convert live in that `next()`).
+- **convert** — start before `convert_to_hf` (raw) or the body of
+  `_postprocess_and_quantize` (bridge); stop when it returns.
+  Includes: vocab unpad of embeddings / `lm_head`; HF layout (rename,
+  split fused QKV, split SwiGLU gate/up); `quantize_params` to the
+  rollout dtype (FP8 / MXFP8 / NVFP4 / compressed-tensors) or a no-op
+  when there is no quant config. Not `load_weights`.
+- **stage** — start before `_get_transfer_ready_params`; stop when it
+  returns (still before `load_weights`).
+  Includes: map HF names to sglang names; hold Q/K/V or expert shards in
+  `_staged_tensors` until the fused sglang param is complete; return the
+  tensors that are ready to load. Not the CPU `load_weights` copy.
+
 ### 2. cpu
 
 **What it measures:** Load to CPU until the moment before the RDMA write.
@@ -95,7 +123,8 @@ sessions of the same replica can run in parallel: count that group **once**
 (longest), like `wire_time`. Then sum every outer `send_bucket`.
 
 **What you see in the log:** Three lines: GPU with max gpu-prep, GPU with max
-cpu-prep, GPU with max `gpu_prep + cpu_prep` (same GPU).
+cpu-prep, GPU with max `gpu_prep + cpu_prep` (same GPU). Then that last
+GPU's gather / convert / stage split.
 
 ---
 
@@ -145,25 +174,33 @@ Aggregation (full transfer = one log section):
 | `max_num_wire_bytes_per_trainer` | `sum(source_lens)` in `_do_p2p_write_one_session` | **sum** (every session) | sum | sum | GPU with max bytes |
 | `wire_time` | timer around `_do_nixl_write` | **max** (count once) | sum | sum | GPU with max work |
 | `trainer_prep_time` gpu | `next(iterator)` until before `load_weights` | n/a (outer, main thread) | n/a | sum | GPU with max gpu_prep |
+| `trainer_prep_time` gpu gather | `_materialize_*` / bridge `export_hf_weights` `next()` | n/a | n/a | sum | that GPU's gather |
+| `trainer_prep_time` gpu convert | `convert_to_hf` / `_postprocess_and_quantize` | n/a | n/a | sum | that GPU's convert |
+| `trainer_prep_time` gpu stage | `_get_transfer_ready_params` | n/a | n/a | sum | that GPU's stage |
 | `trainer_prep_time` cpu | `load_weights` + setup until before `_do_nixl_write` | **max** on setup | **sum** (`load_weights`) | sum | GPU with max cpu_prep |
 | `trainer_active_time` | first `next(iterator)` → `wait_transfers()` done | n/a | n/a | n/a (one wall clock) | GPU with max active |
 
-Each sender payload carries that rank’s `gpu_prep` and `cpu_prep`. Rank 0
-prints three picks:
+Each sender payload carries that rank’s `gpu_prep`, `cpu_prep`, `gpu_gather`,
+`gpu_convert`, and `gpu_stage`. Rank 0 prints three prep picks:
 
 - `argmax(gpu_prep)`
 - `argmax(cpu_prep)`
-- `argmax(gpu_prep + cpu_prep)` on **that same GPU**
+- `argmax(gpu_prep + cpu_prep)` on **that same GPU**, then **that GPU's**
+  gather / convert / stage
 
 Do not define the third number as `max(gpu_prep) + max(cpu_prep)` across
-different GPUs.
+different GPUs. Do not `argmax` gather, convert, or stage on their own.
 
 Hook sites:
 
 - `updater.py` `update_weights`: start `trainer_active_time`; time each
   `next(iterator)` as prep gpu; protocol exposes the collector (updater does
   not import NIXL).
-- `p2p.py` `send_bucket`: time `load_weights` per replica as prep cpu.
+- iterator: time `_materialize_*` as gather, `convert_to_hf` as convert
+  (bridge: `export_hf_weights` `next()` as gather,
+  `_postprocess_and_quantize` as convert).
+- `p2p.py` `send_bucket`: time `_get_transfer_ready_params` as stage; time
+  `load_weights` per replica as prep cpu.
 - `p2p.py` `_do_p2p_write_one_session`: add bytes; cpu-prep continues until
   `_do_nixl_write`; group sessions of one replica so wire_time / cpu-setup
   use max, not sum.
@@ -180,6 +217,9 @@ wire_time: gpu=5 work=2.110s
 trainer_prep_time_gpu: gpu=5 time=0.91s
 trainer_prep_time_cpu: gpu=2 time=0.55s
 trainer_prep_time_total: gpu=5 gpu_prep=0.91s cpu_prep=0.40s total=1.31s
+trainer_prep_time_gpu_gather: gpu=5 time=0.50s
+trainer_prep_time_gpu_convert: gpu=5 time=0.30s
+trainer_prep_time_gpu_stage: gpu=5 time=0.01s
 trainer_active_time: gpu=5 time=3.410s
 ```
 

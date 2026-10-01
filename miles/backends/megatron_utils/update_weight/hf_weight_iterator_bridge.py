@@ -7,6 +7,12 @@ from miles.backends.megatron_utils.update_weight.hf_weight_iterator import (
     MegatronHfWeightIteratorBase,
     _iter_mm_tower_units,
 )
+from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
+    GPU_PREP_CONVERT,
+    GPU_PREP_GATHER,
+    iter_timed_gpu_prep_part,
+    timed_gpu_prep_part,
+)
 from miles.utils import megatron_bridge_utils
 from miles.utils.lora import is_lora_weight_name
 
@@ -43,11 +49,14 @@ class HfWeightIteratorBridge(MegatronHfWeightIteratorBase):
         with megatron_bridge_utils.patch_megatron_model(self.model):
             conversion_tasks = self._bridge.get_conversion_tasks(self.model)
             conversion_tasks = _process_conversion_tasks(conversion_tasks, renamed_megatron_local_weights)
-            named_weights = self._bridge.export_hf_weights(
-                self.model,
-                cpu=False,
-                conversion_tasks=conversion_tasks,
-                merge_adapter_weights=False,
+            named_weights = iter_timed_gpu_prep_part(
+                GPU_PREP_GATHER,
+                self._bridge.export_hf_weights(
+                    self.model,
+                    cpu=False,
+                    conversion_tasks=conversion_tasks,
+                    merge_adapter_weights=False,
+                ),
             )
 
             # Apply postprocess + quantization (when targeting a quantized rollout,
@@ -83,14 +92,19 @@ class HfWeightIteratorBridge(MegatronHfWeightIteratorBase):
 
     def _export_current_adapter(self) -> list:
         with megatron_bridge_utils.patch_megatron_model(self.model):
-            named_weights = self._bridge.export_adapter_weights(self.model, cpu=False, show_progress=False)
+            named_weights = iter_timed_gpu_prep_part(
+                GPU_PREP_GATHER,
+                self._bridge.export_adapter_weights(self.model, cpu=False, show_progress=False),
+            )
             named_weights = self._postprocess_and_quantize(named_weights, "lora")
             return [(h, w) for h, w, _m in named_weights if is_lora_weight_name(h)]
 
     def _postprocess_and_quantize(self, named_weights, weight_type: str):
         for hf_param_name, weight, megatron_param_name in named_weights:
             hf_name = hf_param_name.replace(".base_layer.", ".")
-            weight = postprocess_hf_param(
+            weight = timed_gpu_prep_part(
+                GPU_PREP_CONVERT,
+                postprocess_hf_param,
                 args=self.args,
                 megatron_param_name=megatron_param_name,
                 hf_param_name=hf_name,
@@ -100,8 +114,11 @@ class HfWeightIteratorBridge(MegatronHfWeightIteratorBase):
                 # quantize_params expects the megatron name with the `module.module.`
                 # prefix that the direct iterator uses; the bridge yields it without.
                 qmegatron_name = f"module.module.{megatron_param_name}"
-                for q_hf_name, q_weight in quantize_params(
-                    self.args, qmegatron_name, [(hf_name, weight)], self.quantization_config
+                for q_hf_name, q_weight in iter_timed_gpu_prep_part(
+                    GPU_PREP_CONVERT,
+                    quantize_params(
+                        self.args, qmegatron_name, [(hf_name, weight)], self.quantization_config
+                    ),
                 ):
                     yield q_hf_name, q_weight, megatron_param_name
             else:
