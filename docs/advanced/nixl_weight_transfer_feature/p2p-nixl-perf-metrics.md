@@ -13,16 +13,17 @@ Inside one full transfer there are two loops:
 - **Outer loop:** `for bucket in iter_hf_weights: send_bucket(bucket)`. One
   outer step is one `send_bucket`. All-gather + HF convert for that bucket run
   in `next(iterator)`, just before `send_bucket`.
-- **Inner loop:** inside `send_bucket`, `for replica in _transfer_engine_meta_list`:
-  `load_weights` then RDMA to each remote session. One GPU can have more than
-  one CPU replica.
+- **Inner loop:** on the bucket thread submitted by `send_bucket`,
+  `for replica in _transfer_engine_meta_list`: `load_weights` then RDMA to
+  each remote session. One GPU can have more than one CPU replica. The next
+  fill overlaps that loop.
 
 Which loop a metric uses:
 
 - `trainer_prep_time` gpu — outer (`next(iterator)` until after staging)
   **plus** every inner `load_weights`. Sum every outer step and every load
   of this full transfer.
-- `trainer_prep_time` cpu — host work starting on the main thread right
+- `trainer_prep_time` cpu — host work starting on the bucket thread right
   after `load_weights`, until just before the RDMA write. Then sum across
   inner **and** outer so the logged number is the full transfer.
 - `max_num_wire_bytes_per_trainer`, `wire_time` — inner (replica / session).
@@ -146,7 +147,7 @@ the residual).
 the RDMA write. That is opening the wire group, submitting the session,
 waiting for a pool thread, and pointer setup.
 
-**How we measure it:** One `time.monotonic()` start on the main thread
+**How we measure it:** One `time.monotonic()` start on the bucket thread
 immediately after `load_weights` returns, before `begin_wire_group`. Each
 session of that replica stops right before `_do_nixl_write`. Sessions share
 that start and can run in parallel: count the group **once** (longest stop),
@@ -182,7 +183,7 @@ There is no lock on the RDMA path today, and we do not add one for metrics.
 `P2PTransferManager` runs each session in a thread pool, so several
 `_do_nixl_write` calls can finish at once. Time the write **inside that
 call**, return `(bytes, duration)` on the future, and fold max/sum on the
-**main thread** after `f.result()` / `wait_transfers()`. The clock is just
+bucket thread after `f.result()` / `wait_transfers()`. The clock is just
 `time.monotonic()` around `_do_nixl_write`; the fold is not on the RDMA
 critical path.
 
@@ -246,15 +247,17 @@ Hook sites:
   `_load_or_allocate_params`, `_broadcast_across_pp`,
   `all_gather_params_async` (and its start / wait / concat), and EP
   `all_gather_object` / `all_gather` / wait.
-- `p2p.py` `send_bucket`: time `_get_transfer_ready_params` as stage; time
-  `load_weights` per replica as gpu-prep `cpu_load` (added into `gpu_prep`);
-  start the cpu-prep clock immediately after that `load_weights`.
+- `p2p.py` `send_bucket`: time `_get_transfer_ready_params` as stage; submit
+  `_load_and_write_bucket` so the next fill overlaps this bucket's load and RDMA.
+- `p2p.py` `_load_and_write_bucket`: time `load_weights` per replica as gpu-prep
+  `cpu_load` (added into `gpu_prep`); start the cpu-prep clock immediately after
+  that `load_weights`.
 - `p2p.py` `_do_p2p_write_one_session`: add bytes; stop cpu-prep right before
   `_do_nixl_write`; group sessions of one replica so wire_time / cpu-setup
   use max, not sum.
 - `p2p.py` `_do_nixl_write`: start/stop for wire_time.
-- `p2p.py` `after_base_weights`: `wait_transfers()`, stop active time,
-  `gather_object` on gloo, rank 0 appends to `p2p_nixl_perf.log`.
+- `p2p.py` `after_base_weights`: join the in-flight bucket (`wait_transfers()`),
+  stop active time, `gather_object` on gloo, rank 0 appends to `p2p_nixl_perf.log`.
 
 Log (rank 0, append, one section per `weight_version`):
 
@@ -305,7 +308,7 @@ convert + quant run inside the yield). The outer clock stops at
 same gpu total, so the bar on this plot runs through load to CPU. The
 `cpu_load` line in the log is just that copy.
 
-`trainer_prep_time` cpu starts on the main thread immediately after
+`trainer_prep_time` cpu starts on the bucket thread immediately after
 `load_weights` returns, before `begin_wire_group`. The bar includes opening
 the wire group, submitting the session, pool scheduling, and pointer setup
 (walk names, collect CPU and remote pointers, `add_wire_bytes`). Not a tensor
@@ -317,9 +320,11 @@ call returns (including the DONE poll).
 
 ### One full `update_weights`
 
-Two outer `send_bucket` steps, then `wait_transfers()`. gpu-prep, cpu-prep,
-and `wire_time` are disjoint bars that the log **sums**. `trainer_active_time`
-is one wall clock around them, including the gaps.
+Two outer `send_bucket` steps, then the final join (`wait_transfers()`).
+Within one replica, load, cpu-prep, and `wire_time` run one after another.
+The next bucket's fill overlaps the previous bucket's load and RDMA, so the
+log **sums** those bars and `trainer_active_time` can be shorter than that
+sum. `trainer_active_time` is one wall clock around them, including the gaps.
 
 ![Clock start and stop on one full update_weights](clock-update-weights.svg)
 
@@ -328,8 +333,9 @@ On this plot, **load** is `load_weights` and is part of gpu-prep (`cpu_load`).
 runs through pointer setup. RDMA is `wire_time`, not cpu-prep.
 
 `trainer_active_time` starts at the first `next(iterator)` and stops in
-`after_base_weights` after `wait_transfers()`. Last-replica writes can still
-be in flight until that wait.
+`after_base_weights` after the in-flight bucket is joined and
+`wait_transfers()` returns. Last-replica writes can still be in flight until
+that wait.
 
 Parallel sessions of one replica share the cpu-prep start taken right after
 `load_weights` and each stop before their own `_do_nixl_write`. Each session

@@ -4,6 +4,7 @@ import os
 import time
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 import torch.distributed as dist
@@ -65,7 +66,9 @@ class UpdateWeightP2P(WeightTransferProtocol):
     For each engine rank:
         load_weights(shared buffer) → P2P write
         where the last rank's write is submitted to a background thread
-    wait_transfers() at finish to collect all background writes
+    That replica loop runs on one side thread so the next bucket can be filled
+    during the load and RDMA. The next load joins that thread and waits for the
+    RDMA pool before it reuses the pinned params.
     """
 
     def __init__(self, args: Namespace) -> None:
@@ -90,14 +93,17 @@ class UpdateWeightP2P(WeightTransferProtocol):
             num_workers=getattr(args, "p2p_transfer_num_workers", 4),
             transfer_timeout=getattr(args, "p2p_transfer_timeout", 30.0),
         )
+        # Not a pool worker: this thread waits on the RDMA pool, which deadlocks if it shares it.
+        self._bucket_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="p2p-bucket")
+        self._inflight_bucket: Future[None] | None = None
 
     def after_base_weights(self) -> None:
-        """Wait for all background P2P writes to complete."""
+        """Wait for the in-flight bucket load and every background P2P write."""
         if not self.is_sender:
             stop_active_time(self._nixl_perf)
             gather_and_write_perf_log(self._nixl_perf, is_sender=False)
             return
-        self.transfer_manager.wait_transfers()
+        self._join_inflight_bucket()
         stop_active_time(self._nixl_perf)
         assert len(self._tensor_update_pending) == 0 and len(self._staged_tensors) == 0, (
             f"Some tensors were not transferred during P2P weight update. "
@@ -131,6 +137,10 @@ class UpdateWeightP2P(WeightTransferProtocol):
         Only calls load_weights() with complete accumulated tensors, preventing
         partial writes that would corrupt the shared buffer when different engine
         ranks have different EP expert-to-local mappings.
+
+        When this bucket has tensors to load, the previous bucket's load and RDMA
+        are joined first. This bucket's load and RDMA then run on the side thread
+        so the caller can fill the next bucket before that work finishes.
         """
         if not self.is_sender or not converted_named_tensors:
             stop_gpu_prep(self._nixl_perf)
@@ -142,41 +152,60 @@ class UpdateWeightP2P(WeightTransferProtocol):
         stop_gpu_prep(self._nixl_perf)
 
         if transfer_ready_params and ready_hf_tensors:
-            last_idx = len(self._transfer_engine_meta_list) - 1
-            for i, (model_replica, remote_weight_infos) in enumerate(self._transfer_engine_meta_list):
-                # After the outer clock: this copy joins gpu_prep as the cpu_load part.
-                add_cpu_load(self._nixl_perf, timed_call(model_replica.load_weights, ready_hf_tensors))
-                # CPU-prep covers the host work from here until just before RDMA:
-                # wire group, pool submit, and pointer setup inside the session.
-                cpu_prep_start = time.monotonic()
-
-                begin_wire_group(self._nixl_perf)
-                is_last = i == last_idx
-                if is_last:
-                    # Last engine rank: fire-and-forget all sessions to background,
-                    # as the weight will no longer be overwritten
-                    for remote_session in remote_weight_infos:
-                        self.transfer_manager.submit(
-                            self._do_p2p_write_one_session,
-                            remote_session,
-                            transfer_ready_params,
-                            cpu_prep_start,
-                        )
-                else:
-                    # Non-last engine rank needs to be fully written to target before next update can happen.
-                    futures = [
-                        self.transfer_manager.submit_returning_future(
-                            self._do_p2p_write_one_session,
-                            remote_session,
-                            transfer_ready_params,
-                            cpu_prep_start,
-                        )
-                        for remote_session in remote_weight_infos
-                    ]
-                    for f in futures:
-                        f.result()
+            self._join_inflight_bucket()
+            self._inflight_bucket = self._bucket_executor.submit(
+                self._load_and_write_bucket, transfer_ready_params, ready_hf_tensors
+            )
 
         converted_named_tensors.clear()
+
+    def _load_and_write_bucket(
+        self, transfer_ready_params: list[str], ready_hf_tensors: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        """Load this bucket into the shared pinned params and RDMA it to each replica."""
+        last_idx = len(self._transfer_engine_meta_list) - 1
+        for i, (model_replica, remote_weight_infos) in enumerate(self._transfer_engine_meta_list):
+            # After the outer clock: this copy joins gpu_prep as the cpu_load part.
+            add_cpu_load(self._nixl_perf, timed_call(model_replica.load_weights, ready_hf_tensors))
+            # CPU-prep covers the host work from here until just before RDMA:
+            # wire group, pool submit, and pointer setup inside the session.
+            cpu_prep_start = time.monotonic()
+
+            begin_wire_group(self._nixl_perf)
+            is_last = i == last_idx
+            if is_last:
+                # Last engine rank: fire-and-forget all sessions to background,
+                # as the weight will no longer be overwritten
+                for remote_session in remote_weight_infos:
+                    self.transfer_manager.submit(
+                        self._do_p2p_write_one_session,
+                        remote_session,
+                        transfer_ready_params,
+                        cpu_prep_start,
+                    )
+            else:
+                # Non-last engine rank needs to be fully written to target before next update can happen.
+                futures = [
+                    self.transfer_manager.submit_returning_future(
+                        self._do_p2p_write_one_session,
+                        remote_session,
+                        transfer_ready_params,
+                        cpu_prep_start,
+                    )
+                    for remote_session in remote_weight_infos
+                ]
+                for f in futures:
+                    f.result()
+
+    def _join_inflight_bucket(self) -> None:
+        """Wait until the previous bucket has released the shared pinned params."""
+        inflight = self._inflight_bucket
+        self._inflight_bucket = None
+        try:
+            if inflight is not None:
+                inflight.result()
+        finally:
+            self.transfer_manager.wait_transfers()
 
     def connect(
         self,
@@ -391,8 +420,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
 
         Used by the parallelized submission path where each session within an
         engine rank is submitted as a separate task to P2PTransferManager.
-        `cpu_prep_start` is `time.monotonic()` from the main thread immediately
-        after this replica's `load_weights`.
+        `cpu_prep_start` is `time.monotonic()` immediately after this replica's
+        `load_weights`.
         """
         wire_group = current_wire_group(self._nixl_perf)
         source_ptrs, source_lens = [], []
