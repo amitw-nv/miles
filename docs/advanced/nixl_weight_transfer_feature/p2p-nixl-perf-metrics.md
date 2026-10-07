@@ -292,10 +292,9 @@ clock; it is sampled during pointer setup (`sum(source_lens)`).
 
 ### One `send_bucket`
 
-Pipeline on this plot: all-gather, HF convert, quant, staging,
-`load_weights`, pointer setup, `_do_nixl_write`. Staging and `load_weights`
-are gpu-prep. Extra CPU replicas on this GPU repeat load (still gpu-prep) →
-setup → RDMA after the first replica; the plot shows one replica.
+Pipeline on this plot: all-gather, HF convert, quant, staging, then one
+iteration per CPU replica: `load_weights`, cpu-prep, `_do_nixl_write`. The
+figure draws two replicas. A GPU with more replicas repeats that triple.
 
 ![Clock start and stop on one send_bucket](clock-send-bucket.svg)
 
@@ -304,33 +303,38 @@ setup → RDMA after the first replica; the plot shows one replica.
 
 `trainer_prep_time` gpu starts at that `next(iterator)` (all-gather + HF
 convert + quant run inside the yield). The outer clock stops at
-`stop_gpu_prep()`, after staging. Each `load_weights` is then added into the
-same gpu total, so the bar on this plot runs through load to CPU. The
-`cpu_load` line in the log is just that copy.
+`stop_gpu_prep()`, after staging. Each replica's `load_weights` is its own
+bar on that row and is added into the same gpu total. The `cpu_load` line
+in the log is the sum of those copies.
 
-`trainer_prep_time` cpu starts on the bucket thread immediately after
-`load_weights` returns, before `begin_wire_group`. The bar includes opening
-the wire group, submitting the session, pool scheduling, and pointer setup
-(walk names, collect CPU and remote pointers, `add_wire_bytes`). Not a tensor
-copy. Each session stops immediately before `_do_nixl_write`. Parallel
-sessions share that one start; the replica keeps the longest.
+`trainer_prep_time` cpu is one bar per replica. It starts on the bucket
+thread immediately after that replica's `load_weights` returns, before
+`begin_wire_group`. The bar includes opening the wire group, submitting the
+session, pool scheduling, and pointer setup (walk names, collect CPU and
+remote pointers, `add_wire_bytes`). Not a tensor copy. Each session stops
+immediately before `_do_nixl_write`. Parallel sessions of one replica share
+that one start; the replica keeps the longest. The next replica starts a
+new cpu-prep bar after the previous replica's RDMA.
 
-`wire_time` starts immediately before `_do_nixl_write` and stops when that
-call returns (including the DONE poll).
+`wire_time` is one bar per replica. It starts immediately before
+`_do_nixl_write` and stops when that call returns (including the DONE poll).
+Parallel sessions of one replica keep the longest write, not the sum.
 
 ### One full `update_weights`
 
 Two outer `send_bucket` steps, then the final join (`wait_transfers()`).
-Within one replica, load, cpu-prep, and `wire_time` run one after another.
-The next bucket's fill overlaps the previous bucket's load and RDMA, so the
-log **sums** those bars and `trainer_active_time` can be shorter than that
-sum. `trainer_active_time` is one wall clock around them, including the gaps.
+After each fill the figure draws two replicas: load, cpu-prep, and
+`wire_time`, then the same triple again. A non-last replica finishes RDMA
+before the next replica loads. The next bucket's fill overlaps the previous
+bucket's replica loop, so the log **sums** those bars and
+`trainer_active_time` can be shorter than that sum. `trainer_active_time`
+is one wall clock around them, including the gaps.
 
 ![Clock start and stop on one full update_weights](clock-update-weights.svg)
 
-On this plot, **load** is `load_weights` and is part of gpu-prep (`cpu_load`).
-**setup** is `trainer_prep_time` cpu: it starts at the end of that load and
-runs through pointer setup. RDMA is `wire_time`, not cpu-prep.
+On this plot, each **load** is one replica's `load_weights` and is part of
+gpu-prep (`cpu_load`). Each **cpu** bar is that replica's
+`trainer_prep_time` cpu. Each **RDMA** bar is that replica's `wire_time`.
 
 `trainer_active_time` starts at the first `next(iterator)` and stops in
 `after_base_weights` after the in-flight bucket is joined and

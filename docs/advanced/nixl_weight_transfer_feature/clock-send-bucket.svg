@@ -1,53 +1,77 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 406" width="100%" role="img" aria-label="Clock start / stop on one send_bucket">
 <rect width="980" height="406" fill="#ffffff"/>
 <text x="236" y="22" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="600">Clock start / stop on one send_bucket</text>
-<text x="236" y="40" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Pipeline order, not measured seconds. Filled dot = start. Tick = stop. Triangle = still running. Diamond = byte sample.</text>
-<rect x="236.0" y="54" width="144.8" height="318" fill="#f2f2ee"/>
-<text x="308.4" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">all-gather</text>
-<rect x="380.8" y="54" width="101.4" height="318" fill="#e6e6e0"/>
-<text x="431.5" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">HF convert</text>
-<rect x="482.2" y="54" width="86.9" height="318" fill="#f2f2ee"/>
-<text x="525.6" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">quant</text>
-<rect x="569.0" y="54" width="43.4" height="318" fill="#e6e6e0"/>
-<text x="590.8" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">staging</text>
-<rect x="612.5" y="54" width="115.8" height="318" fill="#f2f2ee"/>
-<text x="670.4" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">load to CPU</text>
-<rect x="728.3" y="54" width="72.4" height="318" fill="#e6e6e0"/>
-<text x="764.5" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">pointer setup</text>
-<rect x="800.7" y="54" width="159.3" height="318" fill="#f2f2ee"/>
-<text x="880.4" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">RDMA</text>
+<text x="236" y="40" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Pipeline order, not measured seconds. Two replicas. Filled dot = start. Tick = stop. Triangle = still running. Diamond = byte sample.</text>
+<rect x="236" y="54" width="110" height="318" fill="#f2f2ee"/>
+<text x="291" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">all-gather</text>
+<rect x="346" y="54" width="80" height="318" fill="#e6e6e0"/>
+<text x="386" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">convert</text>
+<rect x="426" y="54" width="64" height="318" fill="#f2f2ee"/>
+<text x="458" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">quant</text>
+<rect x="490" y="54" width="36" height="318" fill="#e6e6e0"/>
+<text x="508" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">stage</text>
+<rect x="526" y="54" width="70" height="318" fill="#f2f2ee"/>
+<text x="561" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">load 0</text>
+<rect x="596" y="54" width="48" height="318" fill="#e6e6e0"/>
+<text x="620" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">cpu 0</text>
+<rect x="644" y="54" width="99" height="318" fill="#f2f2ee"/>
+<text x="693.5" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">RDMA 0</text>
+<rect x="743" y="54" width="70" height="318" fill="#e6e6e0"/>
+<text x="778" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">load 1</text>
+<rect x="813" y="54" width="48" height="318" fill="#f2f2ee"/>
+<text x="837" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">cpu 1</text>
+<rect x="861" y="54" width="99" height="318" fill="#e6e6e0"/>
+<text x="910.5" y="72" text-anchor="middle" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">RDMA 1</text>
 <line x1="236" y1="140" x2="960" y2="140" stroke="#d6d6d0"/>
 <text x="12" y="105.0" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">trainer_active_time</text>
 <text x="12" y="121.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">first next(iterator) · still open</text>
-<rect x="236.0" y="103.0" width="724.0" height="16" rx="3" fill="#c45a16"/>
-<circle cx="236.0" cy="111.0" r="4.5" fill="#c45a16"/>
-<polygon points="960.0,111.0 951.0,105.0 951.0,117.0" fill="#c45a16"/>
-<text x="246.0" y="99.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">open until wait_transfers()</text>
+<rect x="236" y="103" width="724" height="16" rx="3" fill="#c45a16"/>
+<circle cx="236" cy="111" r="4.5" fill="#c45a16"/>
+<polygon points="960,111 951,105 951,117" fill="#c45a16"/>
+<text x="246" y="99" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">open until wait_transfers()</text>
 <line x1="236" y1="198" x2="960" y2="198" stroke="#d6d6d0"/>
-<text x="12" y="163.0" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">trainer_prep_time gpu</text>
-<text x="12" y="179.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">next(iterator) → after load_weights</text>
-<rect x="236.0" y="161.0" width="492.3" height="16" rx="3" fill="#4a4a4a"/>
-<circle cx="236.0" cy="169.0" r="4.5" fill="#c45a16"/>
-<rect x="726.3" y="161.0" width="4" height="16" fill="#1b1b1b"/>
-<text x="246.0" y="157.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">one outer step</text>
+<text x="12" y="163" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">trainer_prep_time gpu</text>
+<text x="12" y="179" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">fill, then one load per replica</text>
+<rect x="236" y="161" width="290" height="16" rx="3" fill="#4a4a4a"/>
+<circle cx="236" cy="169" r="4.5" fill="#c45a16"/>
+<rect x="524" y="161" width="4" height="16" fill="#1b1b1b"/>
+<text x="246" y="157" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">outer fill</text>
+<rect x="526" y="161" width="70" height="16" rx="3" fill="#4a4a4a"/>
+<circle cx="526" cy="169" r="4.5" fill="#c45a16"/>
+<rect x="594" y="161" width="4" height="16" fill="#1b1b1b"/>
+<text x="532" y="157" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">load 0</text>
+<rect x="743" y="161" width="70" height="16" rx="3" fill="#4a4a4a"/>
+<circle cx="743" cy="169" r="4.5" fill="#c45a16"/>
+<rect x="811" y="161" width="4" height="16" fill="#1b1b1b"/>
+<text x="749" y="157" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">load 1</text>
 <line x1="236" y1="256" x2="960" y2="256" stroke="#d6d6d0"/>
-<text x="12" y="221.0" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">trainer_prep_time cpu</text>
-<text x="12" y="237.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">after load_weights → before RDMA</text>
-<rect x="728.3" y="219.0" width="72.4" height="16" rx="3" fill="#4a4a4a"/>
-<circle cx="728.3" cy="227.0" r="4.5" fill="#c45a16"/>
-<rect x="798.7" y="219.0" width="4" height="16" fill="#1b1b1b"/>
-<text x="738.3" y="215.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">pointer setup</text>
+<text x="12" y="221" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">trainer_prep_time cpu</text>
+<text x="12" y="237" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">one interval per replica; sum</text>
+<rect x="596" y="219" width="48" height="16" rx="3" fill="#4a4a4a"/>
+<circle cx="596" cy="227" r="4.5" fill="#c45a16"/>
+<rect x="642" y="219" width="4" height="16" fill="#1b1b1b"/>
+<text x="602" y="215" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">r0</text>
+<rect x="813" y="219" width="48" height="16" rx="3" fill="#4a4a4a"/>
+<circle cx="813" cy="227" r="4.5" fill="#c45a16"/>
+<rect x="859" y="219" width="4" height="16" fill="#1b1b1b"/>
+<text x="819" y="215" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">r1</text>
 <line x1="236" y1="314" x2="960" y2="314" stroke="#d6d6d0"/>
-<text x="12" y="279.0" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">wire_time</text>
-<text x="12" y="295.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">before _do_nixl_write → returns</text>
-<rect x="800.7" y="277.0" width="159.3" height="16" rx="3" fill="#4a4a4a"/>
-<circle cx="800.7" cy="285.0" r="4.5" fill="#c45a16"/>
-<rect x="958.0" y="277.0" width="4" height="16" fill="#1b1b1b"/>
-<text x="810.7" y="273.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">_do_nixl_write</text>
+<text x="12" y="279" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">wire_time</text>
+<text x="12" y="295" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">one interval per replica; max sessions</text>
+<rect x="644" y="277" width="99" height="16" rx="3" fill="#4a4a4a"/>
+<circle cx="644" cy="285" r="4.5" fill="#c45a16"/>
+<rect x="741" y="277" width="4" height="16" fill="#1b1b1b"/>
+<text x="654" y="273" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">r0</text>
+<rect x="861" y="277" width="99" height="16" rx="3" fill="#4a4a4a"/>
+<circle cx="861" cy="285" r="4.5" fill="#c45a16"/>
+<rect x="958" y="277" width="4" height="16" fill="#1b1b1b"/>
+<text x="871" y="273" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">r1</text>
 <line x1="236" y1="372" x2="960" y2="372" stroke="#d6d6d0"/>
-<text x="12" y="337.0" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">wire_bytes (counter)</text>
-<text x="12" y="353.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">no clock · sampled in setup</text>
-<polygon points="771.8,335.0 778.8,343.0 771.8,351.0 764.8,343.0" fill="#1b1b1b"/>
-<text x="781.8" y="331.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">sum(source_lens)</text>
+<text x="12" y="337" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">wire_bytes (counter)</text>
+<text x="12" y="353" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">no clock · sampled in each cpu prep</text>
+<polygon points="620,335 627,343 620,351 613,343" fill="#1b1b1b"/>
+<text x="630" y="331" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">r0</text>
+<polygon points="837,335 844,343 837,351 830,343" fill="#1b1b1b"/>
+<text x="847" y="331" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">r1</text>
 <line x1="236" y1="372" x2="960" y2="372" stroke="#bdbdb8"/>
 </svg>
