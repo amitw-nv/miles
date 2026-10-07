@@ -29,30 +29,22 @@
 <text x="246.0" y="99.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">one wall clock</text>
 <line x1="236" y1="198" x2="960" y2="198" stroke="#d6d6d0"/>
 <text x="12" y="163.0" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">trainer_prep_time gpu</text>
-<text x="12" y="179.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">each next(iterator); sum buckets</text>
-<rect x="236.0" y="161.0" width="137.6" height="16" rx="3" fill="#4a4a4a"/>
+<text x="12" y="179.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">each next(iterator) + load; sum</text>
+<rect x="236.0" y="161.0" width="195.5" height="16" rx="3" fill="#4a4a4a"/>
 <circle cx="236.0" cy="169.0" r="4.5" fill="#c45a16"/>
-<rect x="371.6" y="161.0" width="4" height="16" fill="#1b1b1b"/>
+<rect x="429.5" y="161.0" width="4" height="16" fill="#1b1b1b"/>
 <text x="246.0" y="157.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">bucket 0</text>
-<rect x="540.1" y="161.0" width="137.6" height="16" rx="3" fill="#4a4a4a"/>
+<rect x="540.1" y="161.0" width="195.5" height="16" rx="3" fill="#4a4a4a"/>
 <circle cx="540.1" cy="169.0" r="4.5" fill="#c45a16"/>
-<rect x="675.6" y="161.0" width="4" height="16" fill="#1b1b1b"/>
+<rect x="733.6" y="161.0" width="4" height="16" fill="#1b1b1b"/>
 <text x="550.1" y="157.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">bucket 1</text>
 <line x1="236" y1="256" x2="960" y2="256" stroke="#d6d6d0"/>
 <text x="12" y="221.0" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">trainer_prep_time cpu</text>
-<text x="12" y="237.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">each load + setup; then sum</text>
-<rect x="373.6" y="219.0" width="57.9" height="16" rx="3" fill="#4a4a4a"/>
-<circle cx="373.6" cy="227.0" r="4.5" fill="#c45a16"/>
-<rect x="429.5" y="219.0" width="4" height="16" fill="#1b1b1b"/>
-<text x="383.6" y="215.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">load 0</text>
+<text x="12" y="237.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">after each load → before RDMA</text>
 <rect x="431.5" y="219.0" width="29.0" height="16" rx="3" fill="#4a4a4a"/>
 <circle cx="431.5" cy="227.0" r="4.5" fill="#c45a16"/>
 <rect x="458.4" y="219.0" width="4" height="16" fill="#1b1b1b"/>
 <text x="441.5" y="215.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">setup 0</text>
-<rect x="677.6" y="219.0" width="57.9" height="16" rx="3" fill="#4a4a4a"/>
-<circle cx="677.6" cy="227.0" r="4.5" fill="#c45a16"/>
-<rect x="733.6" y="219.0" width="4" height="16" fill="#1b1b1b"/>
-<text x="687.6" y="215.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">load 1</text>
 <rect x="735.6" y="219.0" width="29.0" height="16" rx="3" fill="#4a4a4a"/>
 <circle cx="735.6" cy="227.0" r="4.5" fill="#c45a16"/>
 <rect x="762.5" y="219.0" width="4" height="16" fill="#1b1b1b"/>

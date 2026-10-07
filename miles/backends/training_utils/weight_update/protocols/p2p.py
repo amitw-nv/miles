@@ -25,7 +25,6 @@ from miles.backends.training_utils.weight_update.hf_weight_iterator import Weigh
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
 from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
     GPU_PREP_STAGE,
-    TimeMonitor,
     add_cpu_load,
     add_session_cpu_setup,
     add_session_wire_time,
@@ -145,7 +144,11 @@ class UpdateWeightP2P(WeightTransferProtocol):
         if transfer_ready_params and ready_hf_tensors:
             last_idx = len(self._transfer_engine_meta_list) - 1
             for i, (model_replica, remote_weight_infos) in enumerate(self._transfer_engine_meta_list):
+                # After the outer clock: this copy joins gpu_prep as the cpu_load part.
                 add_cpu_load(self._nixl_perf, timed_call(model_replica.load_weights, ready_hf_tensors))
+                # CPU-prep covers the host work from here until just before RDMA:
+                # wire group, pool submit, and pointer setup inside the session.
+                cpu_prep_start = time.monotonic()
 
                 begin_wire_group(self._nixl_perf)
                 is_last = i == last_idx
@@ -157,6 +160,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
                             self._do_p2p_write_one_session,
                             remote_session,
                             transfer_ready_params,
+                            cpu_prep_start,
                         )
                 else:
                     # Non-last engine rank needs to be fully written to target before next update can happen.
@@ -165,6 +169,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
                             self._do_p2p_write_one_session,
                             remote_session,
                             transfer_ready_params,
+                            cpu_prep_start,
                         )
                         for remote_session in remote_weight_infos
                     ]
@@ -379,15 +384,17 @@ class UpdateWeightP2P(WeightTransferProtocol):
 
         return transfer_ready_params, ready_hf_tensors
 
-    def _do_p2p_write_one_session(self, remote_session: RemoteWeightInfo, names: list[str]) -> None:
+    def _do_p2p_write_one_session(
+        self, remote_session: RemoteWeightInfo, names: list[str], cpu_prep_start: float
+    ) -> None:
         """P2P write from shared CPU pinned buffers to a single remote session.
 
         Used by the parallelized submission path where each session within an
         engine rank is submitted as a separate task to P2PTransferManager.
+        `cpu_prep_start` is `time.monotonic()` from the main thread immediately
+        after this replica's `load_weights`.
         """
         wire_group = current_wire_group(self._nixl_perf)
-        cpu_setup = TimeMonitor()
-        cpu_setup.start()
         source_ptrs, source_lens = [], []
         valid_names = []
 
@@ -401,7 +408,6 @@ class UpdateWeightP2P(WeightTransferProtocol):
             valid_names.append(name)
 
         if not source_ptrs:
-            cpu_setup.stop()
             return
 
         add_wire_bytes(self._nixl_perf, sum(source_lens))
@@ -423,14 +429,13 @@ class UpdateWeightP2P(WeightTransferProtocol):
         )
 
         if remote_session.backend == "nixl":
-            add_session_cpu_setup(self._nixl_perf, cpu_setup.stop(), group_id=wire_group)
+            add_session_cpu_setup(self._nixl_perf, time.monotonic() - cpu_prep_start, group_id=wire_group)
             elapsed = timed_call(
                 self._do_nixl_write, remote_session, source_ptrs, source_lens, target_ptrs, target_device_ids
             )
             add_session_wire_time(self._nixl_perf, elapsed, group_id=wire_group)
             return
 
-        cpu_setup.stop()
         ret = self._transfer_engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
         if ret < 0:
             raise RuntimeError(f"[P2P-Shared] Transfer failed for session {session_id}, error: {ret}")

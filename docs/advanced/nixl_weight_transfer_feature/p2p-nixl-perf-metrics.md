@@ -19,11 +19,15 @@ Inside one full transfer there are two loops:
 
 Which loop a metric uses:
 
-- `trainer_prep_time` gpu — outer (`next(iterator)` until before `load_weights`).
-  Sum every outer step of this full transfer.
-- `trainer_prep_time` cpu, `max_num_wire_bytes_per_trainer`, `wire_time` —
-  inner (replica / session). Then sum across inner **and** outer so the
-  logged number is the full transfer.
+- `trainer_prep_time` gpu — outer (`next(iterator)` until after staging)
+  **plus** every inner `load_weights`. Sum every outer step and every load
+  of this full transfer.
+- `trainer_prep_time` cpu — host work starting on the main thread right
+  after `load_weights`, until just before the RDMA write. Then sum across
+  inner **and** outer so the logged number is the full transfer.
+- `max_num_wire_bytes_per_trainer`, `wire_time` — inner (replica / session).
+  Then sum across inner **and** outer so the logged number is the full
+  transfer.
 - `trainer_active_time` — the whole `update_weights` send path, not a sum of
   either loop.
 
@@ -78,15 +82,18 @@ each with the GPU that owns that max (they can be three different GPUs):
 
 ### 1. gpu
 
-**What it measures:** All-gather + HF convert + quant, until the bucket is
-ready to load to CPU.
+**What it measures:** All-gather + HF convert + quant + staging, and the copy
+of that bucket into the pinned CPU replica.
 
-**How we measure it:** Outer: start at `next(iterator)`, stop right before
-`load_weights`. Sum every outer step of this full transfer, per GPU.
+**How we measure it:** Outer clock: start at `next(iterator)`, stop at
+`stop_gpu_prep()` after staging, right before `load_weights`. Then add each
+`load_weights`. Sum every outer step and every load of this full transfer,
+per GPU. RDMA between replicas is not in this sum.
 
-**gpu_prep parts.** Three extra counters inside that wall clock. Each
-sender GPU **sums** that part over this full transfer. Rank 0 does **not**
-pick a max GPU per part. It prints the three numbers from the same GPU as
+**gpu_prep parts.** Gather, convert, and stage are extra counters inside that
+outer clock. `cpu_load` is the `load_weights` time added into `gpu_prep`.
+Each sender GPU **sums** that part over this full transfer. Rank 0 does **not**
+pick a max GPU per part. It prints the numbers from the same GPU as
 `trainer_prep_time_total` (`argmax(gpu_prep + cpu_prep)` on one GPU). They
 need not add up to that GPU's `gpu_prep` (packing, tqdm, checksums stay in
 the residual).
@@ -128,21 +135,28 @@ the residual).
   Includes: map HF names to sglang names; hold Q/K/V or expert shards in
   `_staged_tensors` until the fused sglang param is complete; return the
   tensors that are ready to load. Not the CPU `load_weights` copy.
+- **cpu_load** — each `load_weights`: copy ready HF tensors into the shared
+  pinned CPU replica. Replicas on one GPU run one after another, so **sum**
+  them, then sum every outer `send_bucket`. This is the load-to-CPU slice of
+  `gpu_prep`. Not pointer setup and not the RDMA write.
 
 ### 2. cpu
 
-**What it measures:** Load to CPU until the moment before the RDMA write.
+**What it measures:** Host work after the CPU load, until the moment before
+the RDMA write. That is opening the wire group, submitting the session,
+waiting for a pool thread, and pointer setup.
 
-**How we measure it:** Inner: time `load_weights` plus pointer setup in
-`_do_p2p_write_one_session`, stop right before `_do_nixl_write`. Replicas on
-one GPU run one after the other: **sum** them. Pointer setup for several
-sessions of the same replica can run in parallel: count that group **once**
-(longest), like `wire_time`. Then sum every outer `send_bucket`.
+**How we measure it:** One `time.monotonic()` start on the main thread
+immediately after `load_weights` returns, before `begin_wire_group`. Each
+session of that replica stops right before `_do_nixl_write`. Sessions share
+that start and can run in parallel: count the group **once** (longest stop),
+like `wire_time`. Then sum every replica and every outer `send_bucket`.
+`load_weights` is gpu-prep, not this number.
 
 **What you see in the log:** Three lines: GPU with max gpu-prep, GPU with max
 cpu-prep, GPU with max `gpu_prep + cpu_prep` (same GPU). Then that last
-GPU's gather / convert / stage split. Gather also prints load / PP / TP /
-EP from that same GPU, and TP also prints start / wait / concat.
+GPU's gather / convert / stage / cpu_load split. Gather also prints load /
+PP / TP / EP from that same GPU, and TP also prints start / wait / concat.
 
 ---
 
@@ -191,7 +205,7 @@ Aggregation (full transfer = one log section):
 |---|---|---|---|---|---|
 | `max_num_wire_bytes_per_trainer` | `sum(source_lens)` in `_do_p2p_write_one_session` | **sum** (every session) | sum | sum | GPU with max bytes |
 | `wire_time` | timer around `_do_nixl_write` | **max** (count once) | sum | sum | GPU with max work |
-| `trainer_prep_time` gpu | `next(iterator)` until before `load_weights` | n/a (outer, main thread) | n/a | sum | GPU with max gpu_prep |
+| `trainer_prep_time` gpu | `next(iterator)` until after staging, plus each `load_weights` | n/a (outer, main thread) | **sum** loads | sum | GPU with max gpu_prep |
 | `trainer_prep_time` gpu gather | `_materialize_*` / bridge `export_hf_weights` `next()` | n/a | n/a | sum | that GPU's gather |
 | `trainer_prep_time` gpu gather_load | `_load_or_allocate_params` | n/a | n/a | sum | that GPU's load |
 | `trainer_prep_time` gpu gather_pp | `_broadcast_across_pp` | n/a | n/a | sum | that GPU's PP |
@@ -202,23 +216,24 @@ Aggregation (full transfer = one log section):
 | `trainer_prep_time` gpu gather_ep | EP `all_gather_object` + `all_gather` + wait | n/a | n/a | sum | that GPU's EP |
 | `trainer_prep_time` gpu convert | `convert_to_hf` / `_postprocess_and_quantize` | n/a | n/a | sum | that GPU's convert |
 | `trainer_prep_time` gpu stage | `_get_transfer_ready_params` | n/a | n/a | sum | that GPU's stage |
-| `trainer_prep_time` cpu | `load_weights` + setup until before `_do_nixl_write` | **max** on setup | **sum** (`load_weights`) | sum | GPU with max cpu_prep |
+| `trainer_prep_time` gpu cpu_load | `load_weights` | n/a | **sum** | sum | that GPU's cpu_load |
+| `trainer_prep_time` cpu | after `load_weights` until before `_do_nixl_write` | **max** | sum | sum | GPU with max cpu_prep |
 | `trainer_active_time` | first `next(iterator)` → `wait_transfers()` done | n/a | n/a | n/a (one wall clock) | GPU with max active |
 
 Each sender payload carries that rank’s `gpu_prep`, `cpu_prep`, `gpu_gather`,
 `gpu_gather_load`, `gpu_gather_pp`, `gpu_gather_tp`, `gpu_gather_tp_start`,
 `gpu_gather_tp_wait`, `gpu_gather_tp_concat`, `gpu_gather_ep`,
-`gpu_convert`, and `gpu_stage`. Rank 0 prints three prep picks:
+`gpu_convert`, `gpu_stage`, and `gpu_cpu_load`. Rank 0 prints three prep picks:
 
 - `argmax(gpu_prep)`
 - `argmax(cpu_prep)`
 - `argmax(gpu_prep + cpu_prep)` on **that same GPU**, then **that GPU's**
-  gather / convert / stage (and gather's load / PP / TP / EP, and TP's
-  start / wait / concat)
+  gather / convert / stage / cpu_load (and gather's load / PP / TP / EP,
+  and TP's start / wait / concat)
 
 Do not define the third number as `max(gpu_prep) + max(cpu_prep)` across
-different GPUs. Do not `argmax` gather, convert, stage, or gather chunks
-on their own.
+different GPUs. Do not `argmax` gather, convert, stage, cpu_load, or gather
+chunks on their own.
 
 Hook sites:
 
@@ -232,8 +247,9 @@ Hook sites:
   `all_gather_params_async` (and its start / wait / concat), and EP
   `all_gather_object` / `all_gather` / wait.
 - `p2p.py` `send_bucket`: time `_get_transfer_ready_params` as stage; time
-  `load_weights` per replica as prep cpu.
-- `p2p.py` `_do_p2p_write_one_session`: add bytes; cpu-prep continues until
+  `load_weights` per replica as gpu-prep `cpu_load` (added into `gpu_prep`);
+  start the cpu-prep clock immediately after that `load_weights`.
+- `p2p.py` `_do_p2p_write_one_session`: add bytes; stop cpu-prep right before
   `_do_nixl_write`; group sessions of one replica so wire_time / cpu-setup
   use max, not sum.
 - `p2p.py` `_do_nixl_write`: start/stop for wire_time.
@@ -259,6 +275,7 @@ trainer_prep_time_gpu_gather_tp_concat: gpu=5 time=0.04s
 trainer_prep_time_gpu_gather_ep: gpu=5 time=0.04s
 trainer_prep_time_gpu_convert: gpu=5 time=0.30s
 trainer_prep_time_gpu_stage: gpu=5 time=0.01s
+trainer_prep_time_gpu_cpu_load: gpu=5 time=0.15s
 trainer_active_time: gpu=5 time=3.410s
 ```
 
@@ -273,10 +290,9 @@ clock; it is sampled during pointer setup (`sum(source_lens)`).
 ### One `send_bucket`
 
 Pipeline on this plot: all-gather, HF convert, quant, staging,
-`load_weights`, pointer setup, `_do_nixl_write`. Staging is still gpu-prep
-(`_get_transfer_ready_params` in `send_bucket`). Extra CPU replicas on this
-GPU repeat load → setup → RDMA after the first replica; the plot shows one
-replica after gpu-prep.
+`load_weights`, pointer setup, `_do_nixl_write`. Staging and `load_weights`
+are gpu-prep. Extra CPU replicas on this GPU repeat load (still gpu-prep) →
+setup → RDMA after the first replica; the plot shows one replica.
 
 ![Clock start and stop on one send_bucket](clock-send-bucket.svg)
 
@@ -284,16 +300,17 @@ replica after gpu-prep.
 `update_weights` and does **not** stop at the end of this bucket.
 
 `trainer_prep_time` gpu starts at that `next(iterator)` (all-gather + HF
-convert + quant run inside the yield) and stops at `stop_gpu_prep()`, after
-staging, right before `load_weights`.
+convert + quant run inside the yield). The outer clock stops at
+`stop_gpu_prep()`, after staging. Each `load_weights` is then added into the
+same gpu total, so the bar on this plot runs through load to CPU. The
+`cpu_load` line in the log is just that copy.
 
-`trainer_prep_time` cpu is **two** clocks, not one continuous interval:
-
-- `load_weights`: copy ready HF tensors into the shared pinned CPU replica.
-  That is the actual CPU loading.
-- pointer setup in `_do_p2p_write_one_session`: walk names, collect CPU and
-  remote pointers, `add_wire_bytes`. Not a tensor copy. Stops at
-  `cpu_setup.stop()`, immediately before `_do_nixl_write`.
+`trainer_prep_time` cpu starts on the main thread immediately after
+`load_weights` returns, before `begin_wire_group`. The bar includes opening
+the wire group, submitting the session, pool scheduling, and pointer setup
+(walk names, collect CPU and remote pointers, `add_wire_bytes`). Not a tensor
+copy. Each session stops immediately before `_do_nixl_write`. Parallel
+sessions share that one start; the replica keeps the longest.
 
 `wire_time` starts immediately before `_do_nixl_write` and stops when that
 call returns (including the DONE poll).
@@ -306,13 +323,16 @@ is one wall clock around them, including the gaps.
 
 ![Clock start and stop on one full update_weights](clock-update-weights.svg)
 
-On this plot, **load** is `load_weights` and **setup** is pointer setup.
-Together they are `trainer_prep_time` cpu. RDMA is `wire_time`, not cpu-prep.
+On this plot, **load** is `load_weights` and is part of gpu-prep (`cpu_load`).
+**setup** is `trainer_prep_time` cpu: it starts at the end of that load and
+runs through pointer setup. RDMA is `wire_time`, not cpu-prep.
 
 `trainer_active_time` starts at the first `next(iterator)` and stops in
 `after_base_weights` after `wait_transfers()`. Last-replica writes can still
 be in flight until that wait.
 
-Parallel sessions of one replica each start and stop their own setup and
-`wire_time` clocks; the replica keeps the longest, not the sum.
+Parallel sessions of one replica share the cpu-prep start taken right after
+`load_weights` and each stop before their own `_do_nixl_write`. Each session
+still has its own `wire_time` clock. The replica keeps the longest of each,
+not the sum.
 

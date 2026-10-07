@@ -6,6 +6,7 @@ import pytest
 
 from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import (
     GPU_PREP_CONVERT,
+    GPU_PREP_CPU_LOAD,
     GPU_PREP_GATHER,
     GPU_PREP_GATHER_EP,
     GPU_PREP_GATHER_LOAD,
@@ -59,6 +60,7 @@ def _payload(
     gpu_gather_ep: float = 0.0,
     gpu_convert: float = 0.0,
     gpu_stage: float = 0.0,
+    gpu_cpu_load: float = 0.0,
     cpu_prep: float = 0.0,
     active_time: float = 0.0,
 ) -> dict[str, int | float]:
@@ -79,6 +81,7 @@ def _payload(
         "gpu_gather_ep": gpu_gather_ep,
         "gpu_convert": gpu_convert,
         "gpu_stage": gpu_stage,
+        "gpu_cpu_load": gpu_cpu_load,
         "cpu_prep": cpu_prep,
         "active_time": active_time,
         "weight_version": weight_version,
@@ -110,6 +113,7 @@ def _section(
     gather_ep_s: str = "0.00s",
     convert_s: str = "0.00s",
     stage_s: str = "0.00s",
+    cpu_load_s: str = "0.00s",
     active_gpu: int = 0,
     active_s: str = "0.000s",
 ) -> str:
@@ -131,6 +135,7 @@ def _section(
         f"trainer_prep_time_gpu_gather_ep: gpu={total_gpu} time={gather_ep_s}\n"
         f"trainer_prep_time_gpu_convert: gpu={total_gpu} time={convert_s}\n"
         f"trainer_prep_time_gpu_stage: gpu={total_gpu} time={stage_s}\n"
+        f"trainer_prep_time_gpu_cpu_load: gpu={total_gpu} time={cpu_load_s}\n"
         f"trainer_active_time: gpu={active_gpu} time={active_s}\n"
     )
 
@@ -179,6 +184,7 @@ class TestP2PNixlPerfHelpers:
                     gpu_gather_ep=0.04,
                     gpu_convert=0.30,
                     gpu_stage=0.01,
+                    gpu_cpu_load=0.15,
                     cpu_prep=0.40,
                     active_time=3.410,
                 ),
@@ -209,6 +215,7 @@ class TestP2PNixlPerfHelpers:
             gather_ep_s="0.04s",
             convert_s="0.30s",
             stage_s="0.01s",
+            cpu_load_s="0.15s",
             active_gpu=5,
             active_s="3.410s",
         )
@@ -240,6 +247,7 @@ class TestP2PNixlPerfHelpers:
                     gpu_gather_tp_wait=0.70,
                     gpu_convert=0.05,
                     gpu_stage=0.20,
+                    gpu_cpu_load=0.88,
                 ),
                 _payload(
                     gpu=5,
@@ -256,6 +264,7 @@ class TestP2PNixlPerfHelpers:
                     gpu_gather_ep=0.04,
                     gpu_convert=0.30,
                     gpu_stage=0.01,
+                    gpu_cpu_load=0.15,
                 ),
             ],
         )
@@ -268,10 +277,12 @@ class TestP2PNixlPerfHelpers:
         assert "trainer_prep_time_gpu_gather_ep: gpu=5 time=0.04s" in text
         assert "trainer_prep_time_gpu_convert: gpu=5 time=0.30s" in text
         assert "trainer_prep_time_gpu_stage: gpu=5 time=0.01s" in text
+        assert "trainer_prep_time_gpu_cpu_load: gpu=5 time=0.15s" in text
         assert "gpu_gather: gpu=2" not in text
         assert "time=0.90s" not in text
         assert "time=0.80s" not in text
         assert "time=0.70s" not in text
+        assert "time=0.88s" not in text
 
     def test_gpu_prep_parts_sum_and_reset_with_the_collector(self):
         """Each GPU sums every gather/convert/stage call; the next update_weights drops them."""
@@ -288,6 +299,7 @@ class TestP2PNixlPerfHelpers:
         collector.add_gpu_prep_part(GPU_PREP_GATHER_EP, 0.03)
         collector.add_gpu_prep_part(GPU_PREP_CONVERT, 0.05)
         collector.add_gpu_prep_part(GPU_PREP_STAGE, 0.01)
+        collector.add_gpu_prep_part(GPU_PREP_CPU_LOAD, 0.15)
         assert collector.gpu_gather() == pytest.approx(0.30)
         assert collector.payload()["gpu_gather_load"] == pytest.approx(0.04)
         assert collector.payload()["gpu_gather_pp"] == pytest.approx(0.01)
@@ -298,6 +310,8 @@ class TestP2PNixlPerfHelpers:
         assert collector.payload()["gpu_gather_ep"] == pytest.approx(0.03)
         assert collector.gpu_convert() == pytest.approx(0.05)
         assert collector.gpu_stage() == pytest.approx(0.01)
+        assert collector.payload()["gpu_cpu_load"] == pytest.approx(0.15)
+        assert collector.gpu_prep() == pytest.approx(0.15)
 
         reset_collector(collector, weight_version=2)
         assert collector.gpu_gather() == 0.0
@@ -305,6 +319,8 @@ class TestP2PNixlPerfHelpers:
         assert collector.payload()["gpu_gather_tp_wait"] == 0.0
         assert collector.gpu_convert() == 0.0
         assert collector.gpu_stage() == 0.0
+        assert collector.payload()["gpu_cpu_load"] == 0.0
+        assert collector.gpu_prep() == 0.0
         reset_collector(None, weight_version=0)
 
     def test_unknown_gpu_prep_part_is_rejected(self):
@@ -361,8 +377,8 @@ class TestP2PNixlPerfHelpers:
         reset_collector(collector, weight_version=2)
         assert collector.wire_time() == 0.0
 
-    def test_cpu_prep_sums_load_weights_and_maxes_parallel_setup(self):
-        """cpu_prep: sum load_weights, max pointer-setup per replica, then sum replicas / buckets."""
+    def test_cpu_load_joins_gpu_prep_and_cpu_prep_is_pointer_setup(self):
+        """load_weights adds into gpu_prep and cpu_load. cpu_prep is max host time per replica, then sum."""
         collector = new_collector(gpu=2, pp_rank=0, gathered_dp_rank=2)
         reset_collector(collector, weight_version=1)
         add_cpu_load(collector, 0.10)
@@ -372,11 +388,14 @@ class TestP2PNixlPerfHelpers:
         add_cpu_load(collector, 0.20)
         replica_b = begin_wire_group(collector)
         add_session_cpu_setup(collector, 0.40, group_id=replica_b)
-        assert collector.cpu_prep() == pytest.approx(1.20)
+        assert collector.gpu_prep() == pytest.approx(0.30)
+        assert collector.payload()["gpu_cpu_load"] == pytest.approx(0.30)
+        assert collector.cpu_prep() == pytest.approx(0.90)
 
         reset_collector(collector, weight_version=2)
         assert collector.cpu_prep() == 0.0
         assert collector.gpu_prep() == 0.0
+        assert collector.payload()["gpu_cpu_load"] == 0.0
 
     def test_gpu_prep_sums_outer_steps_and_wrap_starts_on_next(self):
         """gpu_prep starts at next(iterator) and accumulates until stop before load_weights."""
@@ -480,6 +499,7 @@ class TestGatherAndWritePerfLog:
                 gpu_gather_ep=0.04,
                 gpu_convert=0.30,
                 gpu_stage=0.01,
+                gpu_cpu_load=0.15,
                 cpu_prep=0.40,
                 active_time=3.410,
             ),
@@ -510,6 +530,7 @@ class TestGatherAndWritePerfLog:
             gather_ep_s="0.04s",
             convert_s="0.30s",
             stage_s="0.01s",
+            cpu_load_s="0.15s",
             active_gpu=5,
             active_s="3.410s",
         )

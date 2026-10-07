@@ -25,18 +25,14 @@
 <text x="246.0" y="99.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">open until wait_transfers()</text>
 <line x1="236" y1="198" x2="960" y2="198" stroke="#d6d6d0"/>
 <text x="12" y="163.0" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">trainer_prep_time gpu</text>
-<text x="12" y="179.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">next(iterator) → before load_weights</text>
-<rect x="236.0" y="161.0" width="376.5" height="16" rx="3" fill="#4a4a4a"/>
+<text x="12" y="179.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">next(iterator) → after load_weights</text>
+<rect x="236.0" y="161.0" width="492.3" height="16" rx="3" fill="#4a4a4a"/>
 <circle cx="236.0" cy="169.0" r="4.5" fill="#c45a16"/>
-<rect x="610.5" y="161.0" width="4" height="16" fill="#1b1b1b"/>
+<rect x="726.3" y="161.0" width="4" height="16" fill="#1b1b1b"/>
 <text x="246.0" y="157.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">one outer step</text>
 <line x1="236" y1="256" x2="960" y2="256" stroke="#d6d6d0"/>
 <text x="12" y="221.0" fill="#1b1b1b" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" font-weight="600">trainer_prep_time cpu</text>
-<text x="12" y="237.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">load, then setup → before RDMA</text>
-<rect x="612.5" y="219.0" width="115.8" height="16" rx="3" fill="#4a4a4a"/>
-<circle cx="612.5" cy="227.0" r="4.5" fill="#c45a16"/>
-<rect x="726.3" y="219.0" width="4" height="16" fill="#1b1b1b"/>
-<text x="622.5" y="215.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">load_weights</text>
+<text x="12" y="237.0" fill="#5a5a5a" font-family="ui-sans-serif, system-ui, sans-serif" font-size="10">after load_weights → before RDMA</text>
 <rect x="728.3" y="219.0" width="72.4" height="16" rx="3" fill="#4a4a4a"/>
 <circle cx="728.3" cy="227.0" r="4.5" fill="#c45a16"/>
 <rect x="798.7" y="219.0" width="4" height="16" fill="#1b1b1b"/>
