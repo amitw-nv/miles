@@ -20,7 +20,7 @@ class TimeMonitor:
     `wire_time` uses this around `_do_nixl_write`. `trainer_prep_time` gpu uses
     one instance on the collector from `next(iterator)` until after staging;
     each `load_weights` is added into that total separately. `trainer_prep_time`
-    cpu starts on the bucket thread immediately after `load_weights` and stops
+    cpu starts on the main thread immediately after `load_weights` and stops
     in the session before `_do_nixl_write`. `trainer_active_time` uses
     one instance from the first `next(iterator)` until after `wait_transfers()`.
     `timed_call` uses a fresh instance around one function.
@@ -225,7 +225,7 @@ class P2PNixlPerfCollector:
     def add_session_cpu_setup(self, group_id: int | None, duration: float) -> None:
         """Record one session's host time from after `load_weights` until `_do_nixl_write`.
 
-        `trainer_prep_time` cpu: the bucket thread stamps the start. Each session
+        `trainer_prep_time` cpu: the main thread stamps the start. Each session
         reports its own stop. Parallel sessions of one replica land in the same
         group so we take max, not sum, like `wire_time`.
         """
