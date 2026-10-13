@@ -10,6 +10,11 @@ from miles.backends.training_utils.weight_update.protocols.transports.remote_sha
 )
 
 
+@pytest.fixture
+def p2p_transport() -> str:
+    return "mooncake"
+
+
 def test_a_weight_of_another_size_on_the_shard_is_never_written(p2p_sender: Any, mooncake_module: ModuleType) -> None:
     """Writing a weight whose published size differs would run past the target's memory."""
     transport = mooncake_module.MooncakeTransport()
