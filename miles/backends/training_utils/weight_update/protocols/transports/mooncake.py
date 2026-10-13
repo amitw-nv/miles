@@ -1,39 +1,19 @@
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any
 
 import ray
 import torch
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
+from miles.backends.training_utils.weight_update.protocols.transports.remote_shard import (
+    RemoteShard,
+    RemoteWeightLocation,
+)
 from miles.backends.training_utils.weight_update.protocols.utils.rollout_engine_rank_assignment import (
     RolloutEngineRankAssignment,
 )
 from miles.utils import async_utils
-
-
-class RemoteWeightLocation(NamedTuple):
-    address: int
-    numel: int
-    element_size: int
-
-
-@dataclass(frozen=True)
-class RemoteShard:
-    """Mooncake session and published weight addresses for one engine rank's target or draft runner."""
-
-    rollout_engine_ind: int
-    rollout_engine_rank: int
-    runner_role: str
-    session_id: str
-    weight_locations_by_name: dict[str, RemoteWeightLocation]
-
-    @property
-    def published_nbytes_by_name(self) -> dict[str, int]:
-        return {
-            name: location.numel * location.element_size for name, location in self.weight_locations_by_name.items()
-        }
 
 
 class MooncakeTransport:
@@ -118,7 +98,7 @@ class MooncakeTransport:
     def _write_shard(self, remote_shard: RemoteShard, tensors_by_name: dict[str, torch.Tensor]) -> None:
         names = list(tensors_by_name)
         ret = self._transfer_engine.batch_transfer_sync_write(
-            remote_shard.session_id,
+            remote_shard.transport_peer,
             [tensors_by_name[name].data_ptr() for name in names],
             [remote_shard.weight_locations_by_name[name].address for name in names],
             [_nbytes(tensors_by_name[name]) for name in names],
@@ -140,7 +120,7 @@ def _query_remote_shard(
         rollout_engine_ind=rollout_engine_ind,
         rollout_engine_rank=rollout_engine_rank,
         runner_role=runner_role,
-        session_id=session_id,
+        transport_peer=session_id,
         weight_locations_by_name={name: RemoteWeightLocation(*location) for name, location in weights_info.items()},
     )
 
