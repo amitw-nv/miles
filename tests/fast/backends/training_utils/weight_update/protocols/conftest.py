@@ -1,3 +1,4 @@
+import base64
 import ctypes
 import dataclasses
 import importlib
@@ -189,8 +190,10 @@ class _FakeRolloutApi:
         expert_placement: dict | None = None,
         speculative_args: dict | None = None,
         draft_shares_target_weights: bool = True,
+        transport: str = "mooncake",
     ) -> None:
         self.cell_id = cell_id
+        self.transport = transport
         self.draft_shares_target_weights = draft_shares_target_weights
         self.gpu_count = gpu_count
         self.generation = generation
@@ -212,13 +215,21 @@ class _FakeRolloutApi:
         address_role = "target" if self.draft_shares_target_weights else runner_role
         return hash((self.session_id(rank, address_role), name)) & 0xFFFFFFFF
 
-    async def get_remote_instance_transfer_engine_info(self, rank: int, role: str) -> tuple[str, dict]:
+    async def get_remote_instance_transfer_engine_info(self, rank: int, role: str) -> dict:
         self.calls.append(f"get_remote_instance_transfer_engine_info {role}")
         weights = {
             name: (self.published_address(rank, name, role), self.published_weight_numel, 4)
             for name in _PUBLISHED_PARAM_NAMES_BY_RUNNER_ROLE[role]
         }
-        return self.session_id(rank, role), weights
+        if self.transport == "nixl":
+            return {
+                "transport": "nixl",
+                "agent_name": self.session_id(rank, role),
+                "agent_metadata": base64.b64encode(self.session_id(rank, role).encode()).decode("ascii"),
+                "gpu_id": rank,
+                "weights_info_dict": weights,
+            }
+        return {"transport": "mooncake", "session_id": self.session_id(rank, role), "weights_info_dict": weights}
 
     async def get_parallelism_info(self, rank: int, role: str) -> dict:
         self.calls.append(f"get_parallelism_info {role}")

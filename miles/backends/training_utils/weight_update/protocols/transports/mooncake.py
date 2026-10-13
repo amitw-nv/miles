@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from typing import Any
 
 import ray
@@ -8,12 +8,15 @@ import torch
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.weight_update.protocols.transports.remote_shard import (
     RemoteShard,
-    RemoteWeightLocation,
+    query_remote_shards,
+    weight_locations_from_published,
+)
+from miles.backends.training_utils.weight_update.protocols.transports.rollout_engine_write_threads import (
+    RolloutEngineWriteThreads,
 )
 from miles.backends.training_utils.weight_update.protocols.utils.rollout_engine_rank_assignment import (
     RolloutEngineRankAssignment,
 )
-from miles.utils import async_utils
 
 
 class MooncakeTransport:
@@ -29,7 +32,7 @@ class MooncakeTransport:
 
     def __init__(self) -> None:
         self._transfer_engine = _create_transfer_engine()
-        self._write_executors_by_rollout_engine_ind: dict[int, ThreadPoolExecutor] = {}
+        self._write_threads = RolloutEngineWriteThreads(thread_name_prefix="mooncake-write")
 
     def connect(
         self,
@@ -37,35 +40,17 @@ class MooncakeTransport:
         assignments: Sequence[RolloutEngineRankAssignment],
         runner_roles: Sequence[str],
     ) -> dict[str, dict[int, list[RemoteShard]]]:
-        """Return assigned shards by runner role and rollout rank.
-
-        Starts new write threads: a rollout engine index now names a new engine, which must not queue behind the
-        writes of the one it replaced.
-        """
-        for write_executor in self._write_executors_by_rollout_engine_ind.values():
-            write_executor.shutdown(wait=False)
-        self._write_executors_by_rollout_engine_ind = {}
-        return {
-            runner_role: {
-                assignment.rollout_engine_rank: [
-                    _query_remote_shard(
-                        rollout_engines[rollout_engine_ind],
-                        rollout_engine_ind,
-                        assignment.rollout_engine_rank,
-                        runner_role,
-                    )
-                    for rollout_engine_ind in assignment.rollout_engine_indices
-                ]
-                for assignment in assignments
-            }
-            for runner_role in runner_roles
-        }
+        """Return assigned shards by runner role and rollout rank."""
+        self._write_threads.restart()
+        return query_remote_shards(
+            rollout_engines, assignments, runner_roles, "mooncake", _remote_shard_from_published
+        )
 
     def register_memory(self, tensor: torch.Tensor) -> None:
-        ret = self._transfer_engine.register_memory(tensor.data_ptr(), _nbytes(tensor))
+        ret = self._transfer_engine.register_memory(tensor.data_ptr(), tensor.nbytes)
         if ret != 0:
             raise RuntimeError(
-                f"Mooncake could not register {_nbytes(tensor)} bytes at {tensor.data_ptr():#x}: error {ret}"
+                f"Mooncake could not register {tensor.nbytes} bytes at {tensor.data_ptr():#x}: error {ret}"
             )
 
     def unregister_memory(self, tensor: torch.Tensor) -> None:
@@ -76,24 +61,9 @@ class MooncakeTransport:
     def write(self, remote_shards: Sequence[RemoteShard], tensors_by_name: dict[str, torch.Tensor]) -> list[Future]:
         """Writes each tensor into the weight of the same name on every shard; returns one future per shard.
 
-        The tensors must lie in registered memory and stay unchanged until their futures are done. Raises before
-        writing anything if a shard lacks one of the weights or holds it in a different number of bytes.
+        The tensors must lie in registered memory and stay unchanged until their futures are done.
         """
-        for remote_shard in remote_shards:
-            _assert_tensors_fit(remote_shard, tensors_by_name)
-        return [
-            self._write_executor(remote_shard.rollout_engine_ind).submit(
-                self._write_shard, remote_shard, tensors_by_name
-            )
-            for remote_shard in remote_shards
-        ]
-
-    def _write_executor(self, rollout_engine_ind: int) -> ThreadPoolExecutor:
-        if rollout_engine_ind not in self._write_executors_by_rollout_engine_ind:
-            self._write_executors_by_rollout_engine_ind[rollout_engine_ind] = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix=f"mooncake-write-rollout-engine-{rollout_engine_ind}"
-            )
-        return self._write_executors_by_rollout_engine_ind[rollout_engine_ind]
+        return self._write_threads.write_each_shard(remote_shards, tensors_by_name, self._write_shard)
 
     def _write_shard(self, remote_shard: RemoteShard, tensors_by_name: dict[str, torch.Tensor]) -> None:
         names = list(tensors_by_name)
@@ -101,27 +71,21 @@ class MooncakeTransport:
             remote_shard.transport_peer,
             [tensors_by_name[name].data_ptr() for name in names],
             [remote_shard.weight_locations_by_name[name].address for name in names],
-            [_nbytes(tensors_by_name[name]) for name in names],
+            [tensors_by_name[name].nbytes for name in names],
         )
         if ret < 0:
             raise RuntimeError(f"Mooncake batch_transfer_sync_write returned {ret}")
 
 
-def _query_remote_shard(
-    rollout_engine: SGLangApiClient, rollout_engine_ind: int, rollout_engine_rank: int, runner_role: str
+def _remote_shard_from_published(
+    published_weights: dict, rollout_engine_ind: int, rollout_engine_rank: int, runner_role: str
 ) -> RemoteShard:
-    session_id, weights_info = async_utils.run(
-        rollout_engine.get_remote_instance_transfer_engine_info(rank=rollout_engine_rank, role=runner_role)
-    )
-    assert (
-        session_id is not None
-    ), f"the {runner_role} of rollout engine {rollout_engine_ind} rank {rollout_engine_rank} has no Mooncake session"
     return RemoteShard(
         rollout_engine_ind=rollout_engine_ind,
         rollout_engine_rank=rollout_engine_rank,
         runner_role=runner_role,
-        transport_peer=session_id,
-        weight_locations_by_name={name: RemoteWeightLocation(*location) for name, location in weights_info.items()},
+        transport_peer=published_weights["session_id"],
+        weight_locations_by_name=weight_locations_from_published(published_weights),
     )
 
 
@@ -132,22 +96,3 @@ def _create_transfer_engine() -> Any:
     transfer_engine = TransferEngine()
     transfer_engine.initialize(ray._private.services.get_node_ip_address(), "P2PHANDSHAKE", "rdma", "")
     return transfer_engine
-
-
-def _assert_tensors_fit(remote_shard: RemoteShard, tensors_by_name: dict[str, torch.Tensor]) -> None:
-    target = (
-        f"the {remote_shard.runner_role} of rollout engine {remote_shard.rollout_engine_ind} "
-        f"rank {remote_shard.rollout_engine_rank}"
-    )
-    for name, tensor in tensors_by_name.items():
-        assert name in remote_shard.weight_locations_by_name, f"{target} publishes no {name}"
-        location = remote_shard.weight_locations_by_name[name]
-        target_nbytes = location.numel * location.element_size
-        assert target_nbytes == _nbytes(tensor), (
-            f"{name} is {_nbytes(tensor)} bytes here but {target_nbytes} bytes on {target}; "
-            "writing it would run past the target"
-        )
-
-
-def _nbytes(tensor: torch.Tensor) -> int:
-    return tensor.numel() * tensor.element_size()
