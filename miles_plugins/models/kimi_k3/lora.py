@@ -14,17 +14,22 @@ logger = logging.getLogger(__name__)
 # export collation below duplicate miles_plugins/models/inkling/lora.py
 
 _SUPPORTED_TARGET_SUFFIXES = {
-    "self_attention.o_proj",
-    "self_attention.q_a_proj",
-    "self_attention.kv_a_proj_with_mqa",
-    "mlp.linear_fc1",
-    "mlp.linear_fc2",
-    "mlp.experts.linear_fc1",
-    "mlp.experts.linear_fc2",
+    "self_attn.o_proj",
+    "self_attn.q_a_proj",
+    "self_attn.kv_a_proj_with_mqa",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+    "block_sparse_moe.shared_experts.gate_proj",
+    "block_sparse_moe.shared_experts.up_proj",
+    "block_sparse_moe.shared_experts.down_proj",
+    "block_sparse_moe.experts.*.w1",
+    "block_sparse_moe.experts.*.w2",
+    "block_sparse_moe.experts.*.w3",
 }
 
 # the routed-expert down-proj may be omitted: its EP-shared w2_lora_B dominates adapter growth (#1559)
-_OPTIONAL_TARGET_SUFFIXES = {"mlp.experts.linear_fc2"}
+_OPTIONAL_TARGET_SUFFIXES = {"block_sparse_moe.experts.*.w2"}
 
 
 class KimiK3LoRAAdapter(nn.Module):
@@ -113,9 +118,8 @@ def _grouped_linear(inputs: torch.Tensor, weights: torch.Tensor, tokens_per_expe
     return torch.cat([F.linear(segment, weights[idx]) for idx, segment in enumerate(segments)], dim=0)
 
 
-def _validate_targets(args) -> None:
-    targets = set(args.target_modules)
-    suffixes = {target.split("decoder.layers.*.", 1)[-1] for target in targets}
+def resolve_kimi_k3_adapter_targets(targets, *, canonical, experts_shared_outer_loras):
+    suffixes = {target.removeprefix("language_model.model.layers.*.") for target in targets}
     unsupported = suffixes - _SUPPORTED_TARGET_SUFFIXES
     missing = _SUPPORTED_TARGET_SUFFIXES - suffixes - _OPTIONAL_TARGET_SUFFIXES
     if unsupported or missing:
@@ -123,8 +127,11 @@ def _validate_targets(args) -> None:
             "Kimi K3 native LoRA currently requires the verified target set; "
             f"unsupported={sorted(unsupported)}, missing={sorted(missing)}"
         )
-    if not args.experts_shared_outer_loras:
+    assert not canonical, "Kimi K3 native LoRA does not implement canonical_lora"
+    if not experts_shared_outer_loras:
         raise NotImplementedError("Kimi K3 native LoRA currently requires --experts-shared-outer-loras")
+    # Shared-outer export stores the expert dimension in each tensor, not in its name.
+    return [target.replace(".experts.*.", ".experts.") for target in targets]
 
 
 def _enable_full_recompute_input_grads(model) -> None:
@@ -150,31 +157,40 @@ def _apply_attention_lora(attention, args, layer_idx: int, scale: float, dropout
         "kda_attention" if attention.is_kda else "mla_attention",
         f"language_model.model.layers.{layer_idx}.self_attn.",
     )
+    o_proj = attention.linear_attn.out_proj if attention.is_kda else attention.o_proj
 
     _register_param(
         adapter,
         "o_lora_A",
-        attention.o_proj.weight,
-        (rank, attention.o_proj.weight.shape[1]),
+        o_proj.weight,
+        (rank, o_proj.weight.shape[1]),
         init="xavier",
     )
     _register_param(
         adapter,
         "o_lora_B",
-        attention.o_proj.weight,
+        o_proj.weight,
         (hidden_size, rank),
         init="zero",
+        grad_sum_group="tp" if attention.is_kda else None,
     )
 
-    o_proj = attention.o_proj
     original_o_proj = o_proj.forward
 
-    def o_proj_forward(inputs, *forward_args, **forward_kwargs):
-        output, bias = original_o_proj(inputs, *forward_args, **forward_kwargs)
-        local = F.linear(_dropout(inputs, dropout, o_proj.training), adapter.o_lora_A)
-        reduced = reduce_from_tensor_model_parallel_region(local, group=attention.tp_group)
-        delta = F.linear(reduced, adapter.o_lora_B)
-        return torch.add(output, delta, alpha=scale), bias
+    if attention.is_kda:
+
+        def o_proj_forward(inputs):
+            local = F.linear(_dropout(inputs, dropout, o_proj.training), adapter.o_lora_A)
+            return torch.add(original_o_proj(inputs), F.linear(local, adapter.o_lora_B), alpha=scale)
+
+    else:
+
+        def o_proj_forward(inputs, *forward_args, **forward_kwargs):
+            output, bias = original_o_proj(inputs, *forward_args, **forward_kwargs)
+            local = F.linear(_dropout(inputs, dropout, o_proj.training), adapter.o_lora_A)
+            reduced = reduce_from_tensor_model_parallel_region(local, group=attention.tp_group)
+            delta = F.linear(reduced, adapter.o_lora_B)
+            return torch.add(output, delta, alpha=scale), bias
 
     o_proj.forward = o_proj_forward
 
@@ -423,9 +439,8 @@ def apply_kimi_k3_lora(model, args):
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
-    from .layers import KimiK3Attention
+    from .layers import KimiK3Attention, KimiK3KDAAttention
 
-    _validate_targets(args)
     rank = int(args.lora_rank)
     if rank <= 0:
         raise ValueError("apply_kimi_k3_lora requires --lora-rank > 0")
@@ -438,7 +453,7 @@ def apply_kimi_k3_lora(model, args):
 
     for layer in model.decoder.layers:
         layer_idx = layer.layer_number - 1
-        if not isinstance(layer.self_attention, KimiK3Attention):
+        if not isinstance(layer.self_attention, (KimiK3Attention, KimiK3KDAAttention)):
             raise TypeError(f"Kimi K3 layer {layer_idx} has unexpected attention type {type(layer.self_attention)}")
         _apply_attention_lora(layer.self_attention, args, layer_idx, scale, dropout)
 
@@ -451,7 +466,7 @@ def apply_kimi_k3_lora(model, args):
                 layer_idx,
                 scale,
                 dropout,
-                include_fc2=any(target.endswith("mlp.experts.linear_fc2") for target in args.target_modules),
+                include_fc2=any(target.endswith("block_sparse_moe.experts.*.w2") for target in args.hf_lora_targets),
             )
             if layer.mlp.shared_experts is None:
                 raise RuntimeError(f"Kimi K3 MoE layer {layer_idx} is missing shared experts")

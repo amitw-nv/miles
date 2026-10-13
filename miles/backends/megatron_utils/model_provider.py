@@ -82,6 +82,11 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     # attention kernel selection
     provider.attention_backend = args.attention_backend
 
+    # The HF checkpoint can contain an MTP module even when this run trains only
+    # the target model. An explicit runtime value, including None, overrides it.
+    if hasattr(args, "mtp_num_layers"):
+        provider.mtp_num_layers = args.mtp_num_layers
+
     # MoE token dispatcher (same-name, always present)
     provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
 
@@ -337,6 +342,8 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        _maybe_freeze_native_dsa_indexer(args, model)
+
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 
@@ -345,6 +352,15 @@ def get_model_provider_func(
         return model
 
     return model_provider
+
+
+def _maybe_freeze_native_dsa_indexer(args: argparse.Namespace, model: GPTModel) -> None:
+    if args.dsa_impl == "megatron" and model.config.dsa_indexer_loss_coeff == 0:
+        # Native DSA runs its indexer under no_grad without the auxiliary objective.
+        # Exclude these unused parameters from DDP and optimizer weight decay.
+        for name, parameter in model.named_parameters():
+            if ".self_attention.core_attention.indexer." in name:
+                parameter.requires_grad_(False)
 
 
 def _maybe_install_witness(
