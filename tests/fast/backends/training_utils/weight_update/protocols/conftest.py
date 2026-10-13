@@ -187,8 +187,8 @@ class _FakeNixlAgent:
     def __init__(self, transfer_engine: _FakeTransferEngine) -> None:
         self._transfer_engine = transfer_engine
         self.remote_agents: list[str] = []
-        self.remote_gpu_ids_by_agent: dict[str, set[int]] = defaultdict(set)
-        self.running_agents: set[str] = set()
+        self.remote_gpu_ids_by_remote_agent: dict[str, set[int]] = defaultdict(set)
+        self.stuck_remote_agents: set[str] = set()
 
     def get_plugin_list(self) -> list[str]:
         return ["UCX"]
@@ -220,8 +220,8 @@ class _FakeNixlAgent:
 
     def transfer(self, transfer: tuple) -> str:
         local_descs, remote_descs, remote_agent = transfer
-        self.remote_gpu_ids_by_agent[remote_agent].update(gpu_id for _, _, gpu_id in remote_descs)
-        if remote_agent in self.running_agents:
+        self.remote_gpu_ids_by_remote_agent[remote_agent].update(gpu_id for _, _, gpu_id in remote_descs)
+        if remote_agent in self.stuck_remote_agents:
             return "PROC"
         ret = self._transfer_engine.batch_transfer_sync_write(
             remote_agent,

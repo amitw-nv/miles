@@ -34,11 +34,13 @@ class RolloutEngineWriteThreads:
         for remote_shard in remote_shards:
             assert_tensors_fit(remote_shard, tensors_by_name)
         return [
-            self._executor(remote_shard.rollout_engine_ind).submit(write_shard, remote_shard, tensors_by_name)
+            self._get_or_create_executor(remote_shard.rollout_engine_ind).submit(
+                write_shard, remote_shard, tensors_by_name
+            )
             for remote_shard in remote_shards
         ]
 
-    def _executor(self, rollout_engine_ind: int) -> ThreadPoolExecutor:
+    def _get_or_create_executor(self, rollout_engine_ind: int) -> ThreadPoolExecutor:
         if rollout_engine_ind not in self._executors_by_rollout_engine_ind:
             self._executors_by_rollout_engine_ind[rollout_engine_ind] = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix=f"{self._thread_name_prefix}-rollout-engine-{rollout_engine_ind}"

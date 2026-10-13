@@ -11,8 +11,8 @@ import torch
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.weight_update.protocols.transports.remote_shard import (
     RemoteShard,
+    parse_weight_locations,
     query_remote_shards,
-    weight_locations_from_published,
 )
 from miles.backends.training_utils.weight_update.protocols.transports.rollout_engine_write_threads import (
     RolloutEngineWriteThreads,
@@ -70,16 +70,16 @@ class NixlTransport:
         return self._write_threads.write_each_shard(remote_shards, tensors_by_name, self._write_shard)
 
     def _connect_remote_shard(
-        self, published_weights: dict, rollout_engine_ind: int, rollout_engine_rank: int, runner_role: str
+        self, transfer_engine_info: dict, rollout_engine_ind: int, rollout_engine_rank: int, runner_role: str
     ) -> RemoteShard:
-        remote_agent = self._agent.add_remote_agent(base64.b64decode(published_weights["agent_metadata"]))
-        self._gpu_id_by_remote_agent[remote_agent] = published_weights["gpu_id"]
+        remote_agent = self._agent.add_remote_agent(base64.b64decode(transfer_engine_info["agent_metadata"]))
+        self._gpu_id_by_remote_agent[remote_agent] = transfer_engine_info["gpu_id"]
         return RemoteShard(
             rollout_engine_ind=rollout_engine_ind,
             rollout_engine_rank=rollout_engine_rank,
             runner_role=runner_role,
             transport_peer=remote_agent,
-            weight_locations_by_name=weight_locations_from_published(published_weights),
+            weight_locations_by_name=parse_weight_locations(transfer_engine_info),
         )
 
     def _write_shard(self, remote_shard: RemoteShard, tensors_by_name: dict[str, torch.Tensor]) -> None:

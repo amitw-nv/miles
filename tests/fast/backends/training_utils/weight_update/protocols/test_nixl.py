@@ -26,7 +26,7 @@ def test_a_write_addresses_the_gpu_its_rollout_engine_rank_published(
     protocol.send_bucket(make_bucket("hf.w"))
     protocol.after_base_weights()
 
-    assert p2p_sender.nixl_agent.remote_gpu_ids_by_agent == {api.session_id(0): {0}, api.session_id(1): {1}}
+    assert p2p_sender.nixl_agent.remote_gpu_ids_by_remote_agent == {api.session_id(0): {0}, api.session_id(1): {1}}
 
 
 def test_a_transfer_still_running_after_the_timeout_fails_its_write(
@@ -42,7 +42,7 @@ def test_a_transfer_still_running_after_the_timeout_fails_its_write(
     (remote_shard,) = transport.connect([api], assignments, ["target"])["target"][0]
     buffer = torch.zeros(4)
     transport.register_memory(buffer)
-    p2p_sender.nixl_agent.running_agents.add(api.session_id(0))
+    p2p_sender.nixl_agent.stuck_remote_agents.add(api.session_id(0))
 
     (write,) = transport.write([remote_shard], {"w": buffer})
 
@@ -50,7 +50,7 @@ def test_a_transfer_still_running_after_the_timeout_fails_its_write(
         write.result(timeout=5)
 
 
-def test_a_reconnect_drops_the_agents_of_the_rollout_engines_it_replaces(
+def test_a_reconnect_removes_the_agents_of_the_rollout_engines_it_replaces(
     p2p_sender: Any, make_rollout_api: Any
 ) -> None:
     """Agents left loaded for replaced engines would pile up, one set per rollout engine restart."""

@@ -8,8 +8,8 @@ import torch
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.weight_update.protocols.transports.remote_shard import (
     RemoteShard,
+    parse_weight_locations,
     query_remote_shards,
-    weight_locations_from_published,
 )
 from miles.backends.training_utils.weight_update.protocols.transports.rollout_engine_write_threads import (
     RolloutEngineWriteThreads,
@@ -42,9 +42,7 @@ class MooncakeTransport:
     ) -> dict[str, dict[int, list[RemoteShard]]]:
         """Return assigned shards by runner role and rollout rank."""
         self._write_threads.restart()
-        return query_remote_shards(
-            rollout_engines, assignments, runner_roles, "mooncake", _remote_shard_from_published
-        )
+        return query_remote_shards(rollout_engines, assignments, runner_roles, "mooncake", _build_remote_shard)
 
     def register_memory(self, tensor: torch.Tensor) -> None:
         ret = self._transfer_engine.register_memory(tensor.data_ptr(), tensor.nbytes)
@@ -77,15 +75,15 @@ class MooncakeTransport:
             raise RuntimeError(f"Mooncake batch_transfer_sync_write returned {ret}")
 
 
-def _remote_shard_from_published(
-    published_weights: dict, rollout_engine_ind: int, rollout_engine_rank: int, runner_role: str
+def _build_remote_shard(
+    transfer_engine_info: dict, rollout_engine_ind: int, rollout_engine_rank: int, runner_role: str
 ) -> RemoteShard:
     return RemoteShard(
         rollout_engine_ind=rollout_engine_ind,
         rollout_engine_rank=rollout_engine_rank,
         runner_role=runner_role,
-        transport_peer=published_weights["session_id"],
-        weight_locations_by_name=weight_locations_from_published(published_weights),
+        transport_peer=transfer_engine_info["session_id"],
+        weight_locations_by_name=parse_weight_locations(transfer_engine_info),
     )
 
 
