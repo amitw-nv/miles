@@ -485,6 +485,9 @@ def test_server_args_drop_fields_this_sglang_does_not_know(
     assert server_args.model_path == "/model"
 
 
+@pytest.mark.parametrize(
+    "record_factory", [dataclasses.make_dataclass, msgspec.defstruct], ids=["dataclass", "msgspec"]
+)
 def test_the_replica_server_args_are_single_node_for_a_multi_node_engine(
     model_replica_module: ModuleType, monkeypatch: pytest.MonkeyPatch, record_factory
 ) -> None:
