@@ -143,7 +143,10 @@ def _query_config(
 
 
 def _query_server_args(rollout_engine: SGLangApiClient) -> ServerArgs:
-    return create_server_args_from_dict(async_utils.run(rollout_engine.get_server_info()))
+    server_info = async_utils.run(rollout_engine.get_server_info())
+    # This replica is local even when the rollout deployment spans nodes; nnodes > 1 makes sglang's
+    # MultimemAllGatherer probe node topology through the replica's mocked TP group, which crashes.
+    return create_server_args_from_dict({**server_info, "nnodes": 1})
 
 
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:

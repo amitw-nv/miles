@@ -483,3 +483,19 @@ def test_server_args_drop_fields_this_sglang_does_not_know(
 
     assert isinstance(server_args, server_args_type)
     assert server_args.model_path == "/model"
+
+
+def test_the_replica_server_args_are_single_node_for_a_multi_node_engine(
+    model_replica_module: ModuleType, monkeypatch: pytest.MonkeyPatch, record_factory
+) -> None:
+    """The replica is local, so an engine spanning nodes must not make sglang probe the replica's TP group for nodes."""
+    server_args_type = record_factory("ServerArgs", [("model_path", str), ("nnodes", int)])
+    monkeypatch.setattr(model_replica_module, "ServerArgs", server_args_type)
+
+    class _Engine:
+        async def get_server_info(self) -> dict:
+            return {"model_path": "/model", "nnodes": 4}
+
+    server_args = model_replica_module._query_server_args(_Engine())
+
+    assert server_args.nnodes == 1
