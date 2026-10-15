@@ -92,6 +92,12 @@ set -e
 
 MODEL=GLM-5
 MODE="${1:-nixl}"
+case "$MODE" in
+    nixl)      RUN_MODE=p2p;       P2P_TRANSPORT=nixl ;;
+    p2p)       RUN_MODE=p2p;       P2P_TRANSPORT=mooncake ;;
+    broadcast) RUN_MODE=broadcast; P2P_TRANSPORT=mooncake ;;
+    *) echo "ERROR: unknown MODE '$MODE' (nixl | p2p | broadcast)"; exit 1 ;;
+esac
 
 # --- Config ------------------------------------------------------------------
 PORTFOLIO=network_research_advdev
@@ -447,7 +453,7 @@ export MILES_LOG_DIR=/root/signals
 # which is container-local. Convert wrote the tracker on this bind-mount.
 export CKPT_SAVE_DIR=/root/multinode
 cd /root/miles
-bash examples/infra_features/p2p_weight_transfer/GLM-5.sh GLM-5 $MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
+P2P_TRANSPORT=$P2P_TRANSPORT bash examples/infra_features/p2p_weight_transfer/GLM-5.sh GLM-5 $RUN_MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
 
 '
 SLURM

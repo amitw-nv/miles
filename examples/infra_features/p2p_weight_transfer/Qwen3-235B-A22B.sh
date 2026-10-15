@@ -2,11 +2,13 @@
 # Qwen3-235B-A22B: 16 nodes, disaggregated.
 # Usage: bash Qwen3-235B-A22B.sh [MODE] [NODE_RANK] [HEAD_NODE_IP]
 #   MODE         : p2p (default) | broadcast
+#   P2P_TRANSPORT (env): mooncake (default) | nixl, used when MODE=p2p
 #   NODE_RANK    : 0 (head, default) | 1..15 (workers)
 #   HEAD_NODE_IP : IP address of the head node
 set -ex
 
 MODE="${1:-p2p}"
+P2P_TRANSPORT="${P2P_TRANSPORT:-mooncake}"
 NODE_RANK="${2:-0}"
 HEAD_NODE_IP="${3:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,4 +20,4 @@ fi
 
 # Run
 python "${SCRIPT_DIR}/run.py" run Qwen3-235B-A22B-Instruct-2507 \
-    --mode "${MODE}" --node-rank "${NODE_RANK}" --head-ip "${HEAD_NODE_IP}"
+    --mode "${MODE}" --p2p-transport "${P2P_TRANSPORT}" --node-rank "${NODE_RANK}" --head-ip "${HEAD_NODE_IP}"
