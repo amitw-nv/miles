@@ -3,14 +3,12 @@
 # Usage: bash GLM-5.sh <VARIANT> [MODE] [NODE_RANK] [HEAD_NODE_IP]
 #   VARIANT      : GLM-5_4layer | GLM-5_20layer | GLM-5
 #   MODE         : p2p (default) | broadcast
-#   P2P_TRANSPORT (env): mooncake (default) | nixl, used when MODE=p2p
 #   NODE_RANK    : 0 (head, default) | 1..N (workers)
 #   HEAD_NODE_IP : IP address of the head node
 set -ex
 
 VARIANT="${1:?Usage: $0 <VARIANT> [MODE] [NODE_RANK] [HEAD_NODE_IP]}"
 MODE="${2:-p2p}"
-P2P_TRANSPORT="${P2P_TRANSPORT:-mooncake}"
 NODE_RANK="${3:-0}"
 HEAD_NODE_IP="${4:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,4 +32,4 @@ fi
 
 # Run
 python "${SCRIPT_DIR}/run.py" run "${VARIANT}" \
-    --mode "${MODE}" --p2p-transport "${P2P_TRANSPORT}" --node-rank "${NODE_RANK}" --head-ip "${HEAD_NODE_IP}"
+    --mode "${MODE}" --node-rank "${NODE_RANK}" --head-ip "${HEAD_NODE_IP}"

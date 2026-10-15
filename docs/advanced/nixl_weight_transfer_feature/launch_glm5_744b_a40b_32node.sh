@@ -445,7 +445,7 @@ echo "--- [Node \$NODE_RANK] Head IP: \$HEAD_NODE_IP ---"
 
 # ---- Step 6: Run the model --------------------------------------------------
 # HF weights / torch_dist ckpt / datasets come from the Lustre bind-mounts.
-# GLM-5.sh still has a prepare guard, but it will no-op once the
+# Calls run.py directly (the model script cannot pass --p2p-transport); prepare is done above, and it would no-op once the
 # Megatron checkpoint exists on the shared /root/multinode mount.
 echo "--- [Node \$NODE_RANK] Starting $MODEL (mode=$MODE) ---"
 export MILES_LOG_DIR=/root/signals
@@ -453,7 +453,7 @@ export MILES_LOG_DIR=/root/signals
 # which is container-local. Convert wrote the tracker on this bind-mount.
 export CKPT_SAVE_DIR=/root/multinode
 cd /root/miles
-P2P_TRANSPORT=$P2P_TRANSPORT bash examples/infra_features/p2p_weight_transfer/GLM-5.sh GLM-5 $RUN_MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
+python examples/infra_features/p2p_weight_transfer/run.py run GLM-5 --mode $RUN_MODE --p2p-transport $P2P_TRANSPORT --node-rank "\$NODE_RANK" --head-ip "\$HEAD_NODE_IP"
 
 '
 SLURM
