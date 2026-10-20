@@ -17,6 +17,18 @@ from miles.backends.megatron_utils.update_weight.hf_weight_iterator import (
     _iter_mm_tower_units,
 )
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.backends.training_utils.weight_update.gpu_prep_timing import (
+    GPU_PREP_CONVERT,
+    GPU_PREP_GATHER_EP,
+    GPU_PREP_GATHER_LOAD,
+    GPU_PREP_GATHER_PP,
+    GPU_PREP_GATHER_TP,
+    GPU_PREP_GATHER_TP_CONCAT,
+    GPU_PREP_GATHER_TP_START,
+    GPU_PREP_GATHER_TP_WAIT,
+    iter_timed_gpu_prep_part,
+    time_gpu_prep_part,
+)
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.types import ParamInfo
@@ -25,7 +37,8 @@ from miles.utils.types import ParamInfo
 @dataclass(frozen=True)
 class _ExpertBatch:
     param_infos: Sequence[ParamInfo]
-    gathers: tuple[ExpertGather, ...]
+    # (perf part, gather): the part names the gather's group, since size-1 groups are dropped
+    gathers: tuple[tuple[str, ExpertGather], ...]
 
 
 class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
@@ -59,7 +72,9 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
             assert (
                 combined is not None and combined.size == ep_size * edp.size
             ), "The combined TP/DP/CP group must cover all EP/EDP ranks"
-            groups = ([parallel.pp] if self.placement.gather_pp else []) + [combined]
+            groups = ([(GPU_PREP_GATHER_PP, parallel.pp)] if self.placement.gather_pp else []) + [
+                (GPU_PREP_GATHER_EP, combined)
+            ]
             # Pack each owner's share first so a round can quantize on every EDP
             # replica, even when the complete local expert set spans many batches.
             owner_batches = [
@@ -69,7 +84,7 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
             self._expert_batches = [
                 _ExpertBatch(
                     param_infos=batches[edp.rank],
-                    gathers=tuple(ExpertGather(group=group.group) for group in groups if group.size > 1),
+                    gathers=tuple((part, ExpertGather(group=group.group)) for part, group in groups if group.size > 1),
                 )
                 for batches in itertools.zip_longest(*owner_batches, fillvalue=())
             ]
@@ -114,14 +129,18 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
         rank = dist.get_rank()
         # Sender placement is independent of ownership: non-senders also
         # quantize their assigned experts, once across all expert-DP replicas.
-        local_params = (
-            (info.name, weights[info.name].detach().to(device=device, non_blocking=True))
-            for info in batch.param_infos
-            if info.src_rank == rank
+        local_params = iter_timed_gpu_prep_part(
+            GPU_PREP_GATHER_LOAD,
+            (
+                (info.name, weights[info.name].detach().to(device=device, non_blocking=True))
+                for info in batch.param_infos
+                if info.src_rank == rank
+            ),
         )
         units = list(self._convert_to_hf_param_units(local_params))
-        for gather in batch.gathers:
-            units = gather(units, device=device)
+        for part, gather in batch.gathers:
+            with time_gpu_prep_part(part):
+                units = gather(units, device=device)
         return units
 
     def _export_pp_local_lora(self, adapter):
@@ -139,11 +158,13 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
 
     def _convert_to_hf_param_units(self, named_params: Sequence[tuple[str, torch.Tensor]]):
         for name, param in named_params:
-            yield list(
-                convert_to_hf(
-                    self.args, self.model_name, name, param, self.quantization_config, self.packed_weight_basenames
+            with time_gpu_prep_part(GPU_PREP_CONVERT):
+                unit = list(
+                    convert_to_hf(
+                        self.args, self.model_name, name, param, self.quantization_config, self.packed_weight_basenames
+                    )
                 )
-            )
+            yield unit
 
 
 def _load_or_allocate_params(param_infos: Sequence[ParamInfo], megatron_local_weights) -> list[torch.Tensor]:
@@ -191,11 +212,14 @@ def _materialize_non_expert_batch(
 ) -> list[tuple[str, torch.Tensor]]:
     """Load -> PP broadcast (when gather_pp) -> TP all_gather."""
     monkey_patch_torch_reductions()
-    params = _load_or_allocate_params(param_infos, megatron_local_weights)
+    with time_gpu_prep_part(GPU_PREP_GATHER_LOAD):
+        params = _load_or_allocate_params(param_infos, megatron_local_weights)
     if gather_pp:
-        _broadcast_across_pp(param_infos, params)
+        with time_gpu_prep_part(GPU_PREP_GATHER_PP):
+            _broadcast_across_pp(param_infos, params)
     _set_tp_attrs(param_infos, params)
-    gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
+    with time_gpu_prep_part(GPU_PREP_GATHER_TP):
+        gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
     return [(info.name, param) for info, param in zip(param_infos, gathered, strict=True)]
 
 
@@ -212,11 +236,14 @@ def _gather_megatron_expert_batch(
     symmetric EP all_gather with a name exchange.
     """
     monkey_patch_torch_reductions()
-    params = _load_or_allocate_params(param_infos, megatron_local_weights)
+    with time_gpu_prep_part(GPU_PREP_GATHER_LOAD):
+        params = _load_or_allocate_params(param_infos, megatron_local_weights)
     if gather_pp:
-        _broadcast_across_pp(param_infos, params)
+        with time_gpu_prep_part(GPU_PREP_GATHER_PP):
+            _broadcast_across_pp(param_infos, params)
     _set_tp_attrs(param_infos, params)
-    etp_gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
+    with time_gpu_prep_part(GPU_PREP_GATHER_TP):
+        etp_gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
 
     ep = get_parallel_state().ep
     if ep.size == 1:
@@ -224,7 +251,8 @@ def _gather_megatron_expert_batch(
 
     names = [info.name for info in param_infos]
     all_names: list = [None] * ep.size
-    dist.all_gather_object(all_names, names, group=ep.group)
+    with time_gpu_prep_part(GPU_PREP_GATHER_EP):
+        dist.all_gather_object(all_names, names, group=ep.group)
     for ep_names in all_names:
         assert len(ep_names) == len(
             names
@@ -232,13 +260,14 @@ def _gather_megatron_expert_batch(
 
     all_gathered: list[list[tuple[str, torch.Tensor]]] = [[] for _ in range(ep.size)]
     handles = []
-    for i, param in enumerate(etp_gathered):
-        buffers = [torch.empty_like(param, device=torch.cuda.current_device()) for _ in range(ep.size)]
-        handles.append(dist.all_gather(buffers, param, group=ep.group, async_op=True))
-        for ep_rank, ep_names in enumerate(all_names):
-            all_gathered[ep_rank].append((ep_names[i], buffers[ep_rank]))
-    for handle in handles:
-        handle.wait()
+    with time_gpu_prep_part(GPU_PREP_GATHER_EP):
+        for i, param in enumerate(etp_gathered):
+            buffers = [torch.empty_like(param, device=torch.cuda.current_device()) for _ in range(ep.size)]
+            handles.append(dist.all_gather(buffers, param, group=ep.group, async_op=True))
+            for ep_rank, ep_names in enumerate(all_names):
+                all_gathered[ep_rank].append((ep_names[i], buffers[ep_rank]))
+        for handle in handles:
+            handle.wait()
 
     return [named for per_rank in all_gathered for named in per_rank]
 
@@ -424,53 +453,58 @@ def all_gather_params_async(
     gather_tasks = []
     handles = []
 
-    for info, param in param_infos_and_params:
-        # Prepare async all_gather
-        if "expert_bias" in info.name:
-            gather_tasks.append((info, param, None, None, None, None))
-            handles.append(None)
-        elif getattr(param, "parallel_mode", None) == "duplicated" or (
-            not param.tensor_model_parallel and not _is_unmarked_grouped_expert_weight(info.name, param)
-        ):
-            gather_tasks.append((info, param.data, None, None, None, None))
-            handles.append(None)
-        else:
-            # Start async all_gather
-            if is_routed_expert_param(info.name):
-                tp_size = get_parallel_state().etp.size
-                tp_group = get_parallel_state().etp.group
-            else:
-                tp_size = get_parallel_state().tp.size
-                tp_group = get_parallel_state().tp.group
-
-            if tp_size <= 1:
+    with time_gpu_prep_part(GPU_PREP_GATHER_TP_START):
+        for info, param in param_infos_and_params:
+            # Prepare async all_gather
+            if "expert_bias" in info.name:
+                gather_tasks.append((info, param, None, None, None, None))
+                handles.append(None)
+            elif getattr(param, "parallel_mode", None) == "duplicated" or (
+                not param.tensor_model_parallel and not _is_unmarked_grouped_expert_weight(info.name, param)
+            ):
                 gather_tasks.append((info, param.data, None, None, None, None))
                 handles.append(None)
-                continue
+            else:
+                # Start async all_gather
+                if is_routed_expert_param(info.name):
+                    tp_size = get_parallel_state().etp.size
+                    tp_group = get_parallel_state().etp.group
+                else:
+                    tp_size = get_parallel_state().tp.size
+                    tp_group = get_parallel_state().tp.group
 
-            param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
-            handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim, param.partition_stride))
-            handles.append(handle)
+                if tp_size <= 1:
+                    gather_tasks.append((info, param.data, None, None, None, None))
+                    handles.append(None)
+                    continue
+
+                param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
+                handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
+                gather_tasks.append(
+                    (info, None, handle, param_partitions, param.partition_dim, param.partition_stride)
+                )
+                handles.append(handle)
 
     # Phase 2: Wait for ALL async operations to complete at once
     # This ensures maximum parallelism by not blocking on individual operations
-    for handle in handles:
-        if handle is not None:
-            handle.wait()
+    with time_gpu_prep_part(GPU_PREP_GATHER_TP_WAIT):
+        for handle in handles:
+            if handle is not None:
+                handle.wait()
 
     # Phase 3: Process all results after all communications are done
     gathered_params = []
-    for info, direct_param, handle, param_partitions, partition_dim, partition_stride in gather_tasks:
-        if handle is None:
-            # No all_gather needed
-            param = direct_param
-        else:
-            partition_stride, partition_dim = _check_and_fix_partition(
-                args, info.name, partition_stride, partition_dim
-            )
-            param = _gather_with_stride(param_partitions, partition_dim, partition_stride)
+    with time_gpu_prep_part(GPU_PREP_GATHER_TP_CONCAT):
+        for info, direct_param, handle, param_partitions, partition_dim, partition_stride in gather_tasks:
+            if handle is None:
+                # No all_gather needed
+                param = direct_param
+            else:
+                partition_stride, partition_dim = _check_and_fix_partition(
+                    args, info.name, partition_stride, partition_dim
+                )
+                param = _gather_with_stride(param_partitions, partition_dim, partition_stride)
 
-        gathered_params.append(param)
+            gathered_params.append(param)
 
     return gathered_params

@@ -9,6 +9,11 @@ import torch.distributed as dist
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState
+from miles.backends.training_utils.weight_update.gpu_prep_timing import (
+    GPU_PREP_CPU_LOAD,
+    GPU_PREP_STAGE,
+    bind_gpu_prep_parts,
+)
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
 from miles.backends.training_utils.weight_update.protocols.transports.mooncake import MooncakeTransport
@@ -25,6 +30,14 @@ from miles.backends.training_utils.weight_update.protocols.utils.model_replica i
     pack_into_buffers,
     query_rollout_engine_rank_configs,
     query_runner_roles,
+)
+from miles.backends.training_utils.weight_update.protocols.utils.p2p_nixl_perf import (
+    KIND_BUFFER_WAIT,
+    KIND_CPU_PREP,
+    KIND_DRAIN,
+    P2PNixlPerfCollector,
+    measure,
+    write_perf_log,
 )
 from miles.backends.training_utils.weight_update.protocols.utils.rollout_engine_rank_assignment import (
     assign_rollout_engine_ranks,
@@ -68,6 +81,14 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self._transport: MooncakeTransport | NixlTransport | None = None
         self._transfer_buffers: TransferBuffers | None = None
         self._runner_senders: list[_RunnerSender] = []
+        self._perf: P2PNixlPerfCollector | None = None
+
+    @property
+    def _collects_perf(self) -> bool:
+        return self.args.p2p_transport == "nixl"
+
+    def wrap_bucket_iter(self, buckets: Iterator[list[tuple[str, torch.Tensor]]]):
+        return buckets if self._perf is None else self._perf.wrap_buckets(buckets)
 
     def begin_sync(
         self, weight_version: int, iter_buckets: Callable[..., Iterator[list[tuple[str, torch.Tensor]]]]
@@ -91,15 +112,25 @@ class UpdateWeightP2P(WeightTransferProtocol):
             elif self._transfer_buffers.buffer_nbytes < buffer_nbytes:
                 self._transfer_buffers.release()
                 self._transfer_buffers = self._create_transfer_buffers(buffer_nbytes)
+        # after the first pass, so its gather and convert time is not billed to the first transfer
+        if self._perf is not None:
+            self._perf.reset(weight_version)
+        bind_gpu_prep_parts(None if self._perf is None else self._perf.add)
         return True
 
     def after_base_weights(self) -> None:
-        """Wait for every write of this update; fail the update if any write failed or is still running."""
-        if not self.is_sender:
-            return
-        self._transfer_buffers.wait_for_all_writes()
-        for runner_sender in self._runner_senders:
-            runner_sender.model_param_stager.assert_all_done()
+        """Wait for every write of this update; fail the update if any write failed or is still running. With NIXL,
+        then log the transfer's perf metrics, which every rank joins."""
+        if self.is_sender:
+            with measure(self._perf, KIND_DRAIN):
+                self._transfer_buffers.wait_for_all_writes()
+            if self._perf is not None:
+                self._perf.finish()
+            for runner_sender in self._runner_senders:
+                runner_sender.model_param_stager.assert_all_done()
+        bind_gpu_prep_parts(None)
+        if self._collects_perf:
+            write_perf_log(self._perf)
 
     def send_bucket(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> None:
         """Write complete parameter groups to every runner whose loader takes them, as the engine's own updates do."""
@@ -111,20 +142,20 @@ class UpdateWeightP2P(WeightTransferProtocol):
             "replica was mapped for them"
         )
         for runner_sender in self._runner_senders:
-            self._send_runner_bucket(
-                runner_sender,
-                [
+            with measure(self._perf, GPU_PREP_STAGE):
+                loaded_hf_tensors = [
                     (hf_name, tensor)
                     for hf_name, tensor in converted_named_tensors
                     if runner_sender.loads_hf_tensor(hf_name)
-                ],
-            )
+                ]
+            self._send_runner_bucket(runner_sender, loaded_hf_tensors)
         converted_named_tensors.clear()
 
     def _send_runner_bucket(
         self, runner_sender: _RunnerSender, converted_named_tensors: list[tuple[str, torch.Tensor]]
     ) -> None:
-        ready_hf_tensors_by_param_group = runner_sender.model_param_stager.stage(converted_named_tensors)
+        with measure(self._perf, GPU_PREP_STAGE):
+            ready_hf_tensors_by_param_group = runner_sender.model_param_stager.stage(converted_named_tensors)
         for param_groups in pack_into_buffers(
             ready_hf_tensors_by_param_group,
             runner_sender.model_replicas.transfer_buffer_param_layouts,
@@ -135,9 +166,14 @@ class UpdateWeightP2P(WeightTransferProtocol):
                 hf_tensor for param_group in param_groups for hf_tensor in ready_hf_tensors_by_param_group[param_group]
             ]
             for target in runner_sender.replica_targets:
-                buffer = self._transfer_buffers.acquire()
-                param_bytes_by_name = target.model_replica.load_into(buffer, param_names, hf_tensors)
-                writes = self._transport.write(target.remote_shards, param_bytes_by_name)
+                with measure(self._perf, KIND_BUFFER_WAIT):
+                    buffer = self._transfer_buffers.acquire()
+                with measure(self._perf, GPU_PREP_CPU_LOAD):
+                    param_bytes_by_name = target.model_replica.load_into(buffer, param_names, hf_tensors)
+                with measure(self._perf, KIND_CPU_PREP):
+                    writes = self._transport.write(target.remote_shards, param_bytes_by_name)
+                if self._perf is not None:
+                    self._perf.record_write_group(writes)
                 self._transfer_buffers.release_after(buffer, list(zip(target.remote_shards, writes, strict=True)))
 
     def connect(
@@ -153,6 +189,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self.rollout_engines = rollout_engines
         assignments = assign_rollout_engine_ranks(parallel_state, placement, engine_gpu_counts)
         self.is_sender = bool(assignments)
+        self._perf = P2PNixlPerfCollector(gpu=self.global_rank) if self._collects_perf and self.is_sender else None
 
         if self.is_sender:
             runner_roles = query_runner_roles(rollout_engines, assignments, selector)

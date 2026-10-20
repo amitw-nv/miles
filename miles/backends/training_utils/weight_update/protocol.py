@@ -53,6 +53,12 @@ class WeightTransferProtocol(ABC):
         The return value must be identical on every rank."""
         return True
 
+    def wrap_bucket_iter(
+        self, buckets: Iterator[list[tuple[str, torch.Tensor]]]
+    ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        """Hook around the HF bucket stream the updater consumes, e.g. to time each ``next()``; identity by default."""
+        return buckets
+
     @abstractmethod
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None: ...
 
