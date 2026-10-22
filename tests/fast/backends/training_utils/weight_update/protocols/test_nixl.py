@@ -34,7 +34,7 @@ def test_a_transfer_still_running_after_the_timeout_fails_its_write(
 ) -> None:
     """NIXL never abandons a transfer itself: a lost rollout engine would hold its write thread, and every later
     write to that engine, forever."""
-    transport = p2p_protocol.NixlTransport(write_timeout=0.05)
+    transport = p2p_protocol.P2PTransport(p2p_protocol.NixlTransport(write_timeout=0.05))
     api = make_rollout_api("cell-a", gpu_count=1)
     assignments = assign_rollout_engine_ranks_for_data_replica(
         data_replica_rank=0, data_replica_size=1, engine_gpu_counts=[1]

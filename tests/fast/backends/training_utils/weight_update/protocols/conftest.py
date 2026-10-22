@@ -463,7 +463,7 @@ class _P2PSenderHarness:
             call.join()
         for protocol in self._protocols:
             if protocol._transport is not None:
-                for executor in protocol._transport._write_threads._executors_by_rollout_engine_ind.values():
+                for executor in protocol._transport._executors_by_rollout_engine_ind.values():
                     executor.shutdown(wait=True)
 
     def _assign_rollout_engine_ranks(
@@ -635,9 +635,9 @@ def make_remote_shard() -> Callable[..., Any]:
 
 
 @pytest.fixture
-def transport(p2p_sender: Any, mooncake_module: ModuleType) -> Iterator[Any]:
-    transport = mooncake_module.MooncakeTransport()
+def transport(p2p_sender: Any, p2p_protocol: ModuleType, mooncake_module: ModuleType) -> Iterator[Any]:
+    transport = p2p_protocol.P2PTransport(mooncake_module.MooncakeTransport())
     yield transport
     p2p_sender.transfer_engine.release_all()
-    for executor in transport._write_threads._executors_by_rollout_engine_ind.values():
+    for executor in transport._executors_by_rollout_engine_ind.values():
         executor.shutdown(wait=True)

@@ -21,13 +21,12 @@ def p2p_transport() -> str:
     return "mooncake"
 
 
-def _write_threads_module(mooncake_module: ModuleType) -> ModuleType:
-    return sys.modules[mooncake_module.RolloutEngineWriteThreads.__module__]
+def _p2p_transport_module(p2p_protocol: ModuleType) -> ModuleType:
+    return sys.modules[p2p_protocol.P2PTransport.__module__]
 
 
-def test_a_weight_of_another_size_on_the_shard_is_never_written(p2p_sender: Any, mooncake_module: ModuleType) -> None:
+def test_a_weight_of_another_size_on_the_shard_is_never_written(p2p_sender: Any, transport: Any) -> None:
     """Writing a weight whose published size differs would run past the target's memory."""
-    transport = mooncake_module.MooncakeTransport()
     remote_shard = RemoteShard(
         cell_id="cell-a",
         rollout_engine_ind=0,
@@ -120,21 +119,21 @@ class TestNativeFailure:
         with pytest.raises(RuntimeError, match="unknown native completion"):
             transport.unregister_memory(tensor)
         assert p2p_sender.transfer_engine.registered == [(tensor.data_ptr(), tensor.numel() * tensor.element_size())]
-        assert transport._registered_tensors[tensor.data_ptr()] is tensor
+        assert transport._registrations_by_address[tensor.data_ptr()][0] is tensor
 
     def test_a_late_native_failure_uses_the_submitted_update_and_cell_generation(
         self,
         p2p_sender: Any,
         transport: Any,
         make_remote_shard: Any,
-        mooncake_module: ModuleType,
+        p2p_protocol: ModuleType,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A late worker failure must never borrow the active context of a later weight update."""
         events = []
-        monkeypatch.setattr(_write_threads_module(mooncake_module), "is_event_logger_initialized", lambda: True)
+        monkeypatch.setattr(_p2p_transport_module(p2p_protocol), "is_event_logger_initialized", lambda: True)
         monkeypatch.setattr(
-            _write_threads_module(mooncake_module),
+            _p2p_transport_module(p2p_protocol),
             "get_event_logger",
             lambda: SimpleNamespace(log=lambda event_type, data, **kwargs: events.append((event_type, data, kwargs))),
         )
@@ -171,7 +170,7 @@ class TestNativeFailure:
         p2p_sender: Any,
         transport: Any,
         make_remote_shard: Any,
-        mooncake_module: ModuleType,
+        p2p_protocol: ModuleType,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Observability failures must preserve the native error that makes the cell unusable."""
@@ -179,9 +178,9 @@ class TestNativeFailure:
         def fail_log(*args: Any, **kwargs: Any) -> None:
             raise ValueError("logger unavailable")
 
-        monkeypatch.setattr(_write_threads_module(mooncake_module), "is_event_logger_initialized", lambda: True)
+        monkeypatch.setattr(_p2p_transport_module(p2p_protocol), "is_event_logger_initialized", lambda: True)
         monkeypatch.setattr(
-            _write_threads_module(mooncake_module), "get_event_logger", lambda: SimpleNamespace(log=fail_log)
+            _p2p_transport_module(p2p_protocol), "get_event_logger", lambda: SimpleNamespace(log=fail_log)
         )
         tensor = torch.ones(4)
         shard = make_remote_shard()
