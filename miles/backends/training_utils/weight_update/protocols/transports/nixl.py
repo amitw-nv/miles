@@ -2,13 +2,12 @@ import base64
 import os
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from typing import Any
 
 import torch
 
-from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.weight_update.protocols.transports.remote_shard import (
     RemoteShard,
     parse_weight_locations,
@@ -20,6 +19,7 @@ from miles.backends.training_utils.weight_update.protocols.transports.rollout_en
 from miles.backends.training_utils.weight_update.protocols.utils.rollout_engine_rank_assignment import (
     RolloutEngineRankAssignment,
 )
+from miles.backends.training_utils.weight_update.rollout_cell_updater import _RolloutCellUpdater
 
 # a write thread sleeps this long between checks of a running transfer, leaving the GIL to the loads
 _TRANSFER_POLL_SECONDS = 0.0005
@@ -40,12 +40,14 @@ class NixlTransport:
         self._agent = _create_nixl_agent()
         self._write_timeout = write_timeout
         self._write_threads = RolloutEngineWriteThreads(thread_name_prefix="nixl-write")
-        self._registrations_by_address: dict[int, Any] = {}
+        # the registered tensor stays referenced with its registration, so its allocation outlives it
+        self._registrations_by_address: dict[int, tuple[torch.Tensor, Any]] = {}
         self._gpu_id_by_remote_agent: dict[str, int] = {}
 
     def connect(
         self,
-        rollout_engines: Sequence[SGLangApiClient],
+        cell_updaters_of_cell_id: dict[str, _RolloutCellUpdater],
+        engine_cell_ids: Sequence[str],
         assignments: Sequence[RolloutEngineRankAssignment],
         runner_roles: Sequence[str],
     ) -> dict[str, dict[int, list[RemoteShard]]]:
@@ -54,27 +56,47 @@ class NixlTransport:
         for remote_agent in self._gpu_id_by_remote_agent:
             self._agent.remove_remote_agent(remote_agent)
         self._gpu_id_by_remote_agent = {}
-        return query_remote_shards(rollout_engines, assignments, runner_roles, "nixl", self._connect_remote_shard)
+        return query_remote_shards(
+            cell_updaters_of_cell_id, engine_cell_ids, assignments, runner_roles, "nixl", self._connect_remote_shard
+        )
 
     def register_memory(self, tensor: torch.Tensor) -> None:
-        self._registrations_by_address[tensor.data_ptr()] = self._agent.register_memory(tensor)
+        self._registrations_by_address[tensor.data_ptr()] = (tensor, self._agent.register_memory(tensor))
 
     def unregister_memory(self, tensor: torch.Tensor) -> None:
-        self._agent.deregister_memory(self._registrations_by_address.pop(tensor.data_ptr()))
+        if self._write_threads.has_uncertain_writes:
+            raise RuntimeError("Cannot release registered memory after a NIXL write with unknown native completion")
+        _, registration = self._registrations_by_address.pop(tensor.data_ptr())
+        self._agent.deregister_memory(registration)
 
-    def write(self, remote_shards: Sequence[RemoteShard], tensors_by_name: dict[str, torch.Tensor]) -> list[Future]:
+    def write(
+        self,
+        remote_shards: Sequence[RemoteShard],
+        tensors_by_name: dict[str, torch.Tensor],
+        *,
+        run_write: Callable[[RemoteShard, Callable[[], None]], None],
+    ) -> list[Future[None]]:
         """Writes each tensor into the weight of the same name on every shard; returns one future per shard.
 
-        The tensors must lie in registered memory and stay unchanged until their futures are done.
+        Allocations must stay registered while native writes may still read them. Healthy receivers require
+        unchanged bytes until their futures finish.
         """
-        return self._write_threads.write_each_shard(remote_shards, tensors_by_name, self._write_shard)
+        return self._write_threads.write_each_shard(
+            remote_shards, tensors_by_name, run_write=run_write, write_shard=self._write_shard
+        )
 
     def _connect_remote_shard(
-        self, transfer_engine_info: dict, rollout_engine_ind: int, rollout_engine_rank: int, runner_role: str
+        self,
+        transfer_engine_info: dict,
+        cell_id: str,
+        rollout_engine_ind: int,
+        rollout_engine_rank: int,
+        runner_role: str,
     ) -> RemoteShard:
         remote_agent = self._agent.add_remote_agent(base64.b64decode(transfer_engine_info["agent_metadata"]))
         self._gpu_id_by_remote_agent[remote_agent] = transfer_engine_info["gpu_id"]
         return RemoteShard(
+            cell_id=cell_id,
             rollout_engine_ind=rollout_engine_ind,
             rollout_engine_rank=rollout_engine_rank,
             runner_role=runner_role,

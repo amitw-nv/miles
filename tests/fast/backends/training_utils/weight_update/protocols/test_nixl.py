@@ -30,7 +30,7 @@ def test_a_write_addresses_the_gpu_its_rollout_engine_rank_published(
 
 
 def test_a_transfer_still_running_after_the_timeout_fails_its_write(
-    p2p_sender: Any, p2p_protocol: ModuleType, make_rollout_api: Any
+    p2p_sender: Any, p2p_protocol: ModuleType, make_rollout_api: Any, make_cell_updater: Any
 ) -> None:
     """NIXL never abandons a transfer itself: a lost rollout engine would hold its write thread, and every later
     write to that engine, forever."""
@@ -39,12 +39,14 @@ def test_a_transfer_still_running_after_the_timeout_fails_its_write(
     assignments = assign_rollout_engine_ranks_for_data_replica(
         data_replica_rank=0, data_replica_size=1, engine_gpu_counts=[1]
     )
-    (remote_shard,) = transport.connect([api], assignments, ["target"])["target"][0]
+    (remote_shard,) = transport.connect(
+        {"cell-a": make_cell_updater("cell-a", api_client=api)}, ["cell-a"], assignments, ["target"]
+    )["target"][0]
     buffer = torch.zeros(4)
     transport.register_memory(buffer)
     p2p_sender.nixl_agent.stuck_remote_agents.add(api.session_id(0))
 
-    (write,) = transport.write([remote_shard], {"w": buffer})
+    (write,) = transport.write([remote_shard], {"w": buffer}, run_write=lambda shard, write: write())
 
     with pytest.raises(RuntimeError, match=r"NIXL WRITE of 1 weights is PROC after 0.05s"):
         write.result(timeout=5)

@@ -1,12 +1,28 @@
 import asyncio
 import dataclasses
 import logging
+from enum import Enum
+from typing import Any
 
 import httpx
 
 from miles.utils.http_utils import GeneralHttpClientProvider
 
 logger = logging.getLogger(__name__)
+
+
+class WorkerType(Enum):
+    REGULAR = "regular"
+    PREFILL = "prefill"
+    DECODE = "decode"
+    PLACEHOLDER = "placeholder"
+
+    @classmethod
+    def from_server_info(cls, server_info: dict[str, Any]) -> "WorkerType":
+        mode = server_info["disaggregation_mode"]
+        if mode == "null":
+            mode = "regular"
+        return cls(mode)
 
 
 def _compute_headers(api_key: str | None) -> dict[str, str]:
@@ -294,12 +310,19 @@ class SGLangApiClient:
         )
 
     async def check_weights(
-        self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        selector: str = "all",
+        skip_list: list[str] | None = None,
+        names: list[str] | None = None,
     ):
         payload = {"action": action, "allow_quant_error": allow_quant_error, "selector": selector}
         if skip_list is not None:
             # sglang's CheckWeightsReqInput names this field `skip_tensor_list`.
             payload["skip_tensor_list"] = skip_list
+        if names is not None:
+            payload["names"] = names
         return await self._make_request("weights_checker", payload)
 
     async def pull_weights(self, target_version: int, local_checkpoint_dir: str, source_dir: str):
