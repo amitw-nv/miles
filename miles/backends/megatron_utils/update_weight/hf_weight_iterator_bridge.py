@@ -12,12 +12,6 @@ from miles.backends.megatron_utils.update_weight.hf_weight_iterator import (
     _iter_mm_tower_units,
 )
 from miles.backends.training_utils.parallel import get_parallel_state
-from miles.backends.training_utils.weight_update.gpu_prep_timing import (
-    GPU_PREP_CONVERT,
-    GPU_PREP_GATHER,
-    iter_timed_gpu_prep_part,
-    time_gpu_prep_part,
-)
 from miles.utils import megatron_bridge_utils
 from miles.utils.hf_utils.weight_mapping import get_param_name_remap_for_checkpoint
 from miles.utils.lora.utils import is_lora_weight_name
@@ -70,16 +64,12 @@ class HfWeightIteratorBridge(MegatronHfWeightIteratorBase):
             conversion_tasks = _process_conversion_tasks(
                 conversion_tasks, renamed_megatron_local_weights, weight_dtypes=self._export_dtypes
             )
-            # the export is lazy: every `next()` is its TP/EP gather, including the conversion tasks' `.cuda()` copies
-            named_weights = iter_timed_gpu_prep_part(
-                GPU_PREP_GATHER,
-                self._bridge.export_hf_weights(
-                    self.model,
-                    cpu=False,
-                    conversion_tasks=conversion_tasks,
-                    merge_adapter_weights=False,
-                    **self._source_name_kwargs(self._bridge.export_hf_weights),
-                ),
+            named_weights = self._bridge.export_hf_weights(
+                self.model,
+                cpu=False,
+                conversion_tasks=conversion_tasks,
+                merge_adapter_weights=False,
+                **self._source_name_kwargs(self._bridge.export_hf_weights),
             )
 
             # Apply postprocess + quantization (when targeting a quantized rollout,
@@ -149,27 +139,23 @@ class HfWeightIteratorBridge(MegatronHfWeightIteratorBase):
             # Padding/quantization rules key on a Megatron name; packed grouped-expert tensors use the first source.
             megatron_param_name = megatron_param_names[0] if megatron_param_names else None
             hf_name = self._remap_hf_name(hf_param_name).replace(".base_layer.", ".")
-            with time_gpu_prep_part(GPU_PREP_CONVERT):
-                weight = postprocess_hf_param(
-                    args=self.args,
-                    megatron_param_name=megatron_param_name,
-                    hf_param_name=hf_name,
-                    param=weight,
-                )
+            weight = postprocess_hf_param(
+                args=self.args,
+                megatron_param_name=megatron_param_name,
+                hf_param_name=hf_name,
+                param=weight,
+            )
             if weight_type == "base" and self.quantization_config is not None and megatron_param_name is not None:
                 # quantize_params expects the megatron name with the `module.module.`
                 # prefix that the direct iterator uses; the bridge yields it without.
                 # A tensor with no Megatron source (HF-only passthrough) is not a trainable weight: pass it through.
                 qmegatron_name = f"module.module.{megatron_param_name}"
-                for q_hf_name, q_weight in iter_timed_gpu_prep_part(
-                    GPU_PREP_CONVERT,
-                    quantize_params(
-                        self.args,
-                        qmegatron_name,
-                        [(hf_name, weight)],
-                        self.quantization_config,
-                        self.packed_weight_basenames,
-                    ),
+                for q_hf_name, q_weight in quantize_params(
+                    self.args,
+                    qmegatron_name,
+                    [(hf_name, weight)],
+                    self.quantization_config,
+                    self.packed_weight_basenames,
                 ):
                     yield q_hf_name, q_weight, megatron_param_names
             else:

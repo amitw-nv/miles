@@ -27,7 +27,7 @@ class RolloutEngineWriteThreads:
         self,
         remote_shards: Sequence[RemoteShard],
         tensors_by_name: dict[str, torch.Tensor],
-        write_shard: Callable[[RemoteShard, dict[str, torch.Tensor]], object],
+        write_shard: Callable[[RemoteShard, dict[str, torch.Tensor]], None],
     ) -> list[Future]:
         """Runs `write_shard` for each shard on its rollout engine's thread; returns one future per shard. Raises
         before writing anything if a shard lacks one of the weights or holds it in a different number of bytes."""

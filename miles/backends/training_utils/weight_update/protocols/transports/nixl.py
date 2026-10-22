@@ -11,7 +11,6 @@ import torch
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.weight_update.protocols.transports.remote_shard import (
     RemoteShard,
-    WriteStats,
     parse_weight_locations,
     query_remote_shards,
 )
@@ -64,8 +63,7 @@ class NixlTransport:
         self._agent.deregister_memory(self._registrations_by_address.pop(tensor.data_ptr()))
 
     def write(self, remote_shards: Sequence[RemoteShard], tensors_by_name: dict[str, torch.Tensor]) -> list[Future]:
-        """Writes each tensor into the weight of the same name on every shard; returns one future per shard, whose
-        result is that write's `WriteStats`.
+        """Writes each tensor into the weight of the same name on every shard; returns one future per shard.
 
         The tensors must lie in registered memory and stay unchanged until their futures are done.
         """
@@ -84,8 +82,7 @@ class NixlTransport:
             weight_locations_by_name=parse_weight_locations(transfer_engine_info),
         )
 
-    def _write_shard(self, remote_shard: RemoteShard, tensors_by_name: dict[str, torch.Tensor]) -> WriteStats:
-        t_start = time.monotonic()
+    def _write_shard(self, remote_shard: RemoteShard, tensors_by_name: dict[str, torch.Tensor]) -> None:
         names = list(tensors_by_name)
         gpu_id = self._gpu_id_by_remote_agent[remote_shard.transport_peer]
         transfer = self._agent.initialize_xfer(
@@ -113,9 +110,6 @@ class NixlTransport:
                 f"the NIXL WRITE of {len(names)} weights is {state}"
                 + (f" after {self._write_timeout}s" if state == "PROC" else "")
             )
-        return WriteStats(
-            nbytes=sum(tensor.nbytes for tensor in tensors_by_name.values()), t_start=t_start, t_end=time.monotonic()
-        )
 
 
 def _create_nixl_agent() -> Any:

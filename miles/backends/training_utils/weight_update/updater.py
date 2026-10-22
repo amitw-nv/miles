@@ -147,13 +147,11 @@ class WeightUpdater:
             ), "the LoRA checksum manifest is recorded on one rank, which must hold the full adapter"
         with timer("update_weights_implementation"):
             pbar = tqdm(desc=f"[{protocol.group_name}] Update weights", total=0) if protocol.is_sender else None
-            for bucket in protocol.wrap_bucket_iter(
-                self._hf_weight_iterator.iter_hf_weights(
-                    self.weights_getter(),
-                    include_base=sync_base,
-                    adapters=adapters,
-                    materialize=protocol.is_sender,
-                )
+            for bucket in self._hf_weight_iterator.iter_hf_weights(
+                self.weights_getter(),
+                include_base=sync_base,
+                adapters=adapters,
+                materialize=protocol.is_sender,
             ):
                 if protocol.is_sender:
                     if driver and checksums is not None:

@@ -17,14 +17,6 @@ class RemoteWeightLocation(NamedTuple):
     element_size: int
 
 
-class WriteStats(NamedTuple):
-    """What one finished write to one shard reports: payload bytes and its `time.monotonic()` span."""
-
-    nbytes: int
-    t_start: float
-    t_end: float
-
-
 @dataclass(frozen=True)
 class RemoteShard:
     """Published weight addresses of one engine rank's target or draft runner."""

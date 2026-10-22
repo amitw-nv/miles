@@ -41,16 +41,3 @@ def test_a_rollout_engine_publishing_for_another_transport_is_rejected_at_connec
 
     with pytest.raises(AssertionError, match="publishes its weights for nixl, but --p2p-transport is mooncake"):
         p2p_sender.connect(protocol, [make_rollout_api("cell-a", gpu_count=1, transport="nixl")])
-
-
-def test_a_mooncake_transfer_writes_no_perf_log(p2p_sender: Any, make_rollout_api: Any, make_bucket: Any) -> None:
-    """The perf log is NIXL's: Mooncake's writes return no stats, and its ranks must not join the log's gather."""
-    protocol = p2p_sender.make_protocol()
-    p2p_sender.connect(protocol, [make_rollout_api("cell-a", gpu_count=1)])
-    p2p_sender.begin_sync(protocol, weight_version=1)
-
-    protocol.send_bucket(make_bucket("hf.w"))
-    protocol.after_base_weights()
-
-    assert p2p_sender.perf_payloads == []
-    assert not p2p_sender.perf_log_path.exists()
