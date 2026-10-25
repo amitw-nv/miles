@@ -82,6 +82,12 @@ set -e
 
 MODEL=Qwen3-235B-A22B-Instruct-2507
 MODE="${1:-nixl}"
+case "$MODE" in
+    nixl)      RUN_MODE=p2p;       P2P_TRANSPORT=nixl ;;
+    p2p)       RUN_MODE=p2p;       P2P_TRANSPORT=mooncake ;;
+    broadcast) RUN_MODE=broadcast; P2P_TRANSPORT=mooncake ;;
+    *) echo "ERROR: unknown MODE '$MODE' (nixl | p2p | broadcast)"; exit 1 ;;
+esac
 
 # --- Config ------------------------------------------------------------------
 PORTFOLIO=network_research_advdev
@@ -346,7 +352,7 @@ export MILES_LOG_DIR=/root/signals
 # so the env var is inherited when the model script is sourced inside run.py.
 export MODEL_ARGS_ROTARY_BASE=5000000
 cd /root/miles
-bash examples/infra_features/p2p_weight_transfer/Qwen3-235B-A22B.sh $MODE "\$NODE_RANK" "\$HEAD_NODE_IP"
+python examples/infra_features/p2p_weight_transfer/run.py run $MODEL --mode $RUN_MODE --p2p-transport $P2P_TRANSPORT --node-rank "\$NODE_RANK" --head-ip "\$HEAD_NODE_IP"
 
 '
 SLURM
