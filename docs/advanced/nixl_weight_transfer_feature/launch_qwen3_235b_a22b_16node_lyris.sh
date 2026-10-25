@@ -306,6 +306,12 @@ git -C /sgl-workspace/sglang checkout -B $SGLANG_BRANCH $SGLANG_SHA
 # ---- Lyris GB200 nodes have 4 GPUs; run.py defaults to 8 per node ----------
 # Throw-away edit of the checkout (not committed).
 sed -i -e "s/^    gpus_per_node: int = 8/    gpus_per_node: int = 4/" -e "s/^    convert_gpus_per_node: int = 8/    convert_gpus_per_node: int = 4/" /root/miles/examples/infra_features/p2p_weight_transfer/run.py
+# The image transformers natively knows model_type qwen4_exp_text, which this miles
+# branch registers without override_hf_native and so refuses at parse_args. Unused by Qwen3.
+sed -i "s/^    override_hf_native: bool = False/    override_hf_native: bool = True/" /root/miles/miles/utils/hf_utils/config.py
+# miles defaults --num-gpus-per-node to 8 and run.py never passes it, so an 8-GPU sglang
+# engine is built as 1 node x tp8 and fails on 4-GPU nodes. Pass 4 so it spans 2 nodes.
+sed -i "s/^\(    args.extend(\[\\"--actor-num-gpus-per-node\\".*\)/\1\n    args.extend([\\"--num-gpus-per-node\\", str(cfg.gpus_per_node)])/" /root/miles/examples/infra_features/p2p_weight_transfer/run.py
 sed -i "/^    \\"$MODEL\\": RunConfig(/,/^    ),/ s/nnodes=[0-9]*/nnodes=$NUM_NODES/" /root/miles/examples/infra_features/p2p_weight_transfer/run.py
 
 # ---- Step 4: Print active commits -------------------------------------------
