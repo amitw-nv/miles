@@ -82,7 +82,7 @@ PARTITION=gb200
 NUM_NODES=8   # GB200 nodes have 4 GPUs: 32 GPUs = 8 nodes
 
 MILES_FORK=https://github.com/amitw-nv/miles.git
-MILES_BRANCH=amitw/miles-nixl-upstream-exp
+MILES_BRANCH=amitw/miles-nixl-refactoringcheck
 
 SGLANG_FORK=https://github.com/amitw-nv/sglang.git
 SGLANG_BRANCH=amitw/sgl-miles-nixl-upstream-pr
