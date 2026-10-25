@@ -84,15 +84,10 @@ by `assert_tensors_fit`). Sum every shard, every group, every runner role.
 **How we measure it:** `_write_shard` records `(t_start, t_end, nbytes)` with
 `time.monotonic()` and returns it on its future. No lock on the RDMA path.
 
-Because buffers overlap, summing durations double counts. Two numbers:
-
-- `wire_time` = **union** of all `[t_start, t_end]` intervals on this GPU
-  (interval merge, wall clock during which at least one write was in
-  flight). This is what `bytes / wire_time` should use.
-- `wire_time_sum` = sum over write groups of the **longest** shard in the
-  group. This is the old definition (parallel sessions counted once, groups
-  summed) and is kept so old and new logs can be compared. It is `>=
-  wire_time` when groups overlap.
+Because buffers overlap, summing durations would double count, so
+`wire_time` = **union** of all `[t_start, t_end]` intervals on this GPU
+(interval merge, wall clock during which at least one write was in flight).
+This is what `bytes / wire_time` should use.
 
 **Log:** GPU with the largest `wire_time`.
 
@@ -102,8 +97,75 @@ Because buffers overlap, summing durations double counts. Two numbers:
 
 The log has **three** numbers, each with the GPU that owns that max (can be
 three different GPUs): max `gpu_prep`, max `cpu_prep`, and max
-`gpu_prep + cpu_prep` on the **same** GPU. Never add two category maxes from
-different GPUs.
+`gpu_prep + cpu_prep + exposed_wire` (the **total**) on the **same** GPU.
+Never add two category maxes from different GPUs.
+
+The total includes the exposed wire (`buffer_wait + drain`, section 3):
+the trainer main thread waits for it, so it is part of the time the trainer
+spends on the transfer. It is also printed as a sub metric of the total.
+
+### How the total is computed, and what overlap does to it
+
+The total is a plain sum of main-thread stopwatches, with no overlap
+adjustment and no de-duplication:
+
+```text
+total = next(iterator)   # all-gather + convert/quantize + unit assembly/bucketing
+      + stage            # stage + the loads_hf_tensor filter
+      + cpu_load         # load_into
+      + cpu_prep         # transport.write() submit
+      + buffer_wait      # blocked in acquire()
+      + drain            # wait_for_all_writes() at the end
+```
+
+- Gather and convert are timed **inside** `next(iterator)`. They are
+  breakdown lines (`gather*`, `convert`), not extra terms, so they are not
+  added a second time.
+- `next(iterator)` is more than gather plus convert: it also holds unit
+  assembly, bucketing and tower units. There is no line for that, so
+  `gpu_prep` is larger than `gather + convert + stage + cpu_load`.
+- Each timer is summed over every bucket, chunk, replica target and runner
+  role, per GPU. Rank 0 then takes the GPU with the largest sum; it never adds
+  numbers from different GPUs.
+
+**Overlap does not double count.** The main thread is one thread: gather,
+convert, stage, `acquire`, `load_into` and the `write()` submit run one after
+another. What runs in parallel is the main thread and the engine write
+threads, so loading into buffer B overlaps the **RDMA** of buffer A, not the
+load into A. The two loads are back to back on the same thread, so `cpu_load`
+adds `load A + load B`, which is time the main thread really spent.
+
+```text
+main   : [next: gather+convert][stage][acq A][load A][submit A][acq B][load B][submit B][next ...]
+engine :                                                [======= RDMA A =======]
+                                                                                 [==== RDMA B ====]
+```
+
+| Part | Clock | Effect of overlap |
+|---|---|---|
+| `gpu_prep` (next, stage, `cpu_load`) | main thread | None, serial main-thread time. |
+| `cpu_prep` (`write()` submit) | main thread | None. |
+| `buffer_wait` | main thread, inside `acquire()` | Only counts when the buffer is still busy. If RDMA A already finished while we prepared, it is about 0. |
+| `drain` | main thread, once at the end | The tail of the last writes that nothing was left to hide. |
+| `wire_time` | engine threads | Shards on different engine threads can run at the same time, so it uses the interval union, not a sum. |
+
+So overlap works in the trainer's favour and the exposed wire absorbs it:
+
+- RDMA fully hidden behind prep: `buffer_wait` and `drain` are small and
+  `total ≈ gpu_prep + cpu_prep`. `wire_time` can be large and does not
+  appear in the total.
+- RDMA slower than prep: the main thread stalls in `acquire()` and `drain` is
+  long, so `total ≈ wire_time` plus the first prep.
+
+The total never adds `wire_time` on top of prep; it adds only the part of the
+wire the main thread had to wait for.
+
+**Sanity check.** Every term is a disjoint main-thread interval, so
+`total ≈ trainer_active_time`, with `active` slightly larger by the untimed
+residual (`pack_into_buffers`, `release_after`, list building). If `active`
+is much larger than the total, there is untimed main-thread work to find. If
+the total is larger than `active`, something is double counted. The log does
+not print this comparison today.
 
 ### 1. gpu
 
@@ -124,7 +186,7 @@ load" when there is one runner role.
 
 **gpu_prep parts.** Gather, convert, stage and cpu_load are extra counters
 inside gpu_prep. Rank 0 does **not** pick a max GPU per part: it prints the
-numbers from the GPU that owns `argmax(gpu_prep + cpu_prep)`. They need not
+numbers from the GPU that owns `argmax(gpu_prep + cpu_prep + exposed_wire)`. They need not
 add up to that GPU's `gpu_prep`; the rest (unit assembly, bucketing, tower
 units, tqdm, checksums) is the residual.
 
@@ -174,21 +236,22 @@ Not part of this number, because they are not main-thread host prep any more:
 - descriptor build and `initialize_xfer` — inside `_write_shard`, so inside
   `wire_time`, same as the old `_do_nixl_write`.
 
-### 3. exposed wire (new)
+### 3. exposed wire (new, part of the total)
 
-`trainer_prep_time` no longer adds up to anything close to the transfer time
-once buffers overlap, so we add the part of RDMA that the main thread actually
-waited for:
+`gpu_prep + cpu_prep` alone no longer adds up to anything close to the
+transfer time once buffers overlap, so the total also counts the part of RDMA
+that the main thread actually waited for:
 
 - `buffer_wait` — time blocked in `TransferBuffers.acquire()` waiting for the
   writes that still read the next buffer (sum over the transfer).
 - `drain` — `wait_for_all_writes()` in `after_base_weights` (tail of the last
   writes).
-- `trainer_exposed_wire_time = buffer_wait + drain`. If this is small relative
-  to `wire_time`, the double buffer hides RDMA; if it is close to `wire_time`,
+- `exposed_wire = buffer_wait + drain`. If this is small relative to
+  `wire_time`, the double buffer hides RDMA; if it is close to `wire_time`,
   the transfer is wire-bound.
 
-**Log:** GPU with the largest `buffer_wait + drain`.
+**Log:** a sub metric (`trainer_prep_time_exposed_wire`) of the total, with
+the values of the total's GPU. Its own max is not picked.
 
 ---
 
@@ -240,24 +303,25 @@ Aggregation (full transfer = one log section):
 |---|---|---|---|---|---|
 | `max_num_wire_bytes_per_trainer` | `sum(nbytes)` in `_write_shard` | sum (every shard) | n/a | sum | GPU with max bytes |
 | `wire_time` | `[t_start, t_end]` of `_write_shard` | union | **union** | union | GPU with max |
-| `wire_time_sum` | same | **max** (count once) | sum | sum | GPU with max |
 | `write_queue` | `t_start - t_submit_return` | **max** | sum | sum | that GPU's value |
 | `trainer_prep_time` gpu | inside `next(iterator)` + `stage` + `load_into` | n/a (main thread) | n/a | sum | GPU with max gpu_prep |
 | gpu parts (`gather*`, `convert`, `stage`, `cpu_load`) | see sections above | n/a | n/a | sum | the max-total GPU's values |
 | `trainer_prep_time` cpu | `load_into` return -> `transport.write` return | n/a (main thread) | n/a | sum | GPU with max cpu_prep |
 | `buffer_wait` | `acquire()` | n/a | n/a | sum | that GPU's value |
 | `drain` | `wait_for_all_writes()` | n/a | n/a | n/a (once) | that GPU's value |
-| `trainer_exposed_wire_time` | `buffer_wait + drain` | n/a | n/a | n/a | GPU with max |
+| `trainer_prep_time` exposed wire (sub metric of total) | `buffer_wait + drain` | n/a | n/a | n/a | the max-total GPU's values |
+| `trainer_prep_time` total | `gpu_prep + cpu_prep + buffer_wait + drain` | n/a | n/a | n/a | GPU with max total |
 | `trainer_active_time` | first `next(iterator)` -> after drain | n/a | n/a | n/a (one clock) | GPU with max |
 
 Per-sender payload carries: `gpu_prep`, `cpu_prep`, the gpu parts
 (`gather`, `gather_load`, `gather_pp`, `gather_tp`, `gather_tp_start`,
 `gather_tp_wait`, `gather_tp_concat`, `gather_ep`, `convert`, `stage`,
-`cpu_load`), `wire_bytes`, `wire_time`, `wire_time_sum`, `write_queue`,
+`cpu_load`), `wire_bytes`, `wire_time`, `write_queue`,
 `buffer_wait`, `drain`, `active`.
 
 Rank 0 prints three prep picks (`argmax(gpu_prep)`, `argmax(cpu_prep)`,
-`argmax(gpu_prep + cpu_prep)` on one GPU) and then that last GPU's parts.
+`argmax(gpu_prep + cpu_prep + buffer_wait + drain)` on one GPU), then that
+last GPU's parts and its `buffer_wait` / `drain` breakdown.
 Do not define the third as `max(gpu_prep) + max(cpu_prep)` across GPUs.
 
 ### Hook sites
@@ -285,11 +349,11 @@ Rank 0, append, one section per `weight_version`. New lines marked `(new)`.
 ```text
 === p2p nixl perf  weight_version=12 ===
 max_num_wire_bytes_per_trainer: gpu=5 bytes=13.31GB
-wire_time: gpu=5 busy=2.110s sum_groups=3.480s
+wire_time: gpu=5 time=2.110s
 write_queue: gpu=5 time=0.62s                                   (new)
 trainer_prep_time_gpu: gpu=5 time=0.91s
 trainer_prep_time_cpu: gpu=2 time=0.05s
-trainer_prep_time_total: gpu=5 gpu_prep=0.91s cpu_prep=0.03s total=0.94s
+trainer_prep_time_total: gpu=5 gpu_prep=0.91s cpu_prep=0.03s exposed_wire=0.75s total=1.69s
 trainer_prep_time_gpu_gather: gpu=5 time=0.50s
 trainer_prep_time_gpu_gather_load: gpu=5 time=0.04s
 trainer_prep_time_gpu_gather_pp: gpu=5 time=0.00s
@@ -301,7 +365,7 @@ trainer_prep_time_gpu_gather_ep: gpu=5 time=0.04s
 trainer_prep_time_gpu_convert: gpu=5 time=0.30s
 trainer_prep_time_gpu_stage: gpu=5 time=0.01s
 trainer_prep_time_gpu_cpu_load: gpu=5 time=0.15s
-trainer_exposed_wire_time: gpu=5 buffer_wait=0.40s drain=0.35s total=0.75s   (new)
+trainer_prep_time_exposed_wire: gpu=5 buffer_wait=0.40s drain=0.35s total=0.75s   (new)
 trainer_active_time: gpu=5 time=2.600s
 ```
 

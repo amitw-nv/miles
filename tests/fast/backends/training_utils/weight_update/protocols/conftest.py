@@ -9,11 +9,13 @@ from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 import pytest
 import torch
 
+from miles.backends.training_utils.weight_update.gpu_prep_timing import bind_gpu_prep_parts
 from miles.backends.training_utils.weight_update.protocols.utils.loader_probe import HfNameMapping
 from miles.backends.training_utils.weight_update.protocols.utils.rollout_engine_rank_assignment import (
     assign_rollout_engine_ranks_for_data_replica,
@@ -320,7 +322,9 @@ class _ProtocolCall:
 
 
 class _P2PSenderHarness:
-    def __init__(self, p2p_protocol: ModuleType, monkeypatch: pytest.MonkeyPatch, p2p_transport: str) -> None:
+    def __init__(
+        self, p2p_protocol: ModuleType, monkeypatch: pytest.MonkeyPatch, p2p_transport: str, perf_log_path: Path
+    ) -> None:
         self._p2p_protocol = p2p_protocol
         self.p2p_transport = p2p_transport
         self.log: list[tuple] = []
@@ -332,7 +336,12 @@ class _P2PSenderHarness:
         self._calls: list[_ProtocolCall] = []
         self.assignment_inputs: list[tuple[Any, list[int]]] = []
         self.first_passes = 0
+        self.perf_log_path = perf_log_path
+        self.perf_payloads: list[Any] = []
 
+        perf_module = sys.modules[p2p_protocol.write_perf_log.__module__]
+        monkeypatch.setattr(perf_module, "_gather_payloads", self._gather_perf_payloads)
+        monkeypatch.setattr(perf_module, "perf_log_path", lambda: self.perf_log_path)
         mooncake_transport = sys.modules[p2p_protocol.MooncakeTransport.__module__]
         monkeypatch.setattr(mooncake_transport, "_create_transfer_engine", self._create_transfer_engine)
         monkeypatch.setattr(
@@ -394,7 +403,13 @@ class _P2PSenderHarness:
         self._calls.append(call)
         return call
 
+    def _gather_perf_payloads(self, payload: Any) -> list[Any]:
+        """The gloo gather of one rank: rank 0 gets just this rank's payload."""
+        self.perf_payloads.append(payload)
+        return [payload]
+
     def close(self) -> None:
+        bind_gpu_prep_parts(None)
         self.transfer_engine.release_all()
         for call in self._calls:
             call.join()
@@ -509,6 +524,11 @@ def mooncake_module(p2p_protocol: ModuleType) -> ModuleType:
 
 
 @pytest.fixture(scope="module")
+def perf_module(p2p_protocol: ModuleType) -> ModuleType:
+    return sys.modules[p2p_protocol.write_perf_log.__module__]
+
+
+@pytest.fixture(scope="module")
 def model_replica_module(p2p_protocol: ModuleType) -> ModuleType:
     return sys.modules[p2p_protocol.query_rollout_engine_rank_configs.__module__]
 
@@ -520,9 +540,9 @@ def p2p_transport(request: pytest.FixtureRequest) -> str:
 
 @pytest.fixture
 def p2p_sender(
-    p2p_protocol: ModuleType, monkeypatch: pytest.MonkeyPatch, p2p_transport: str
+    p2p_protocol: ModuleType, monkeypatch: pytest.MonkeyPatch, p2p_transport: str, tmp_path: Path
 ) -> Iterator[_P2PSenderHarness]:
-    harness = _P2PSenderHarness(p2p_protocol, monkeypatch, p2p_transport)
+    harness = _P2PSenderHarness(p2p_protocol, monkeypatch, p2p_transport, tmp_path / "p2p_nixl_perf.log")
     yield harness
     harness.close()
 
