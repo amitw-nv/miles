@@ -27,6 +27,8 @@ class NixlTransport:
         self._agent = _create_nixl_agent()
         self._write_timeout = write_timeout
         self._gpu_id_by_remote_agent: dict[str, int] = {}
+        # a write that did not finish does not prove NIXL stopped reading its source
+        self._has_failed_writes = False
 
     def connect_peer(self, transfer_engine_info: dict) -> str:
         remote_agent = self._agent.add_remote_agent(base64.b64decode(transfer_engine_info["agent_metadata"]))
@@ -42,6 +44,10 @@ class NixlTransport:
         return self._agent.register_memory(tensor)
 
     def unregister_tensor(self, registration: Any) -> None:
+        if self._has_failed_writes:
+            raise RuntimeError(
+                f"Cannot release registered memory after a {self.name} write with unknown native completion"
+            )
         self._agent.deregister_memory(registration)
 
     def write_shard(self, remote_shard: RemoteShard, tensors_by_name: dict[str, torch.Tensor]) -> None:
@@ -59,6 +65,7 @@ class NixlTransport:
             ),
             remote_shard.transport_peer,
         )
+        state = None
         try:
             state = self._agent.transfer(transfer)
             deadline = time.monotonic() + self._write_timeout
@@ -66,6 +73,9 @@ class NixlTransport:
                 time.sleep(_TRANSFER_POLL_SECONDS)
                 state = self._agent.check_xfer_state(transfer)
         finally:
+            # write threads share this flag: only ever set it, so one thread's success never clears another's failure
+            if state != "DONE":
+                self._has_failed_writes = True
             self._agent.release_xfer_handle(transfer)
         if state != "DONE":
             raise RuntimeError(

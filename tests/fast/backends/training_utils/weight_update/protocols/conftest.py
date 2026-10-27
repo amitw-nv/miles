@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 import torch
 
+from miles.backends.sglang_utils.sglang_config import SglangConfig
 from miles.backends.training_utils.weight_update.checksum_utils import hash_tensor_sha256
 from miles.backends.training_utils.weight_update.protocols.transports.remote_shard import (
     RemoteShard,
@@ -335,8 +336,9 @@ class _FakeRolloutApi:
             if not landed:
                 continue
             offset = 1.0 if rank in self.corrupted_ranks or selector in self.corrupted_roles else 0.0
+            prefix = "" if selector == "target" else f"{selector}."
             checksums = {
-                (name if selector == "target" else f"{selector}.{name}"): hash_tensor_sha256(
+                f"{prefix}{name}": hash_tensor_sha256(
                     torch.tensor(landed[self.published_address(rank, name, selector)]) + offset
                 )
                 for name in names
@@ -427,7 +429,7 @@ class _P2PSenderHarness:
             update_weight_engine_request_timeout=_FAILURE_BOUND,
             update_weight_buffer_size=update_weight_buffer_size,
             check_weight_transfer_checksum=check_weight_transfer_checksum,
-            sglang_pp_size=1,
+            sglang=SglangConfig(models=[], base_args={"pp_size": 1}),
             p2p_transport=self.p2p_transport,
         )
         protocol = self._p2p_protocol.UpdateWeightP2P(args)

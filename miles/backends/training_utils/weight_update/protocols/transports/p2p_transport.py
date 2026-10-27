@@ -41,7 +41,9 @@ class NativeTransport(Protocol):
     def register_tensor(self, tensor: torch.Tensor) -> Any:
         """Registers the tensor's memory with the library; returns what `unregister_tensor` takes."""
 
-    def unregister_tensor(self, registration: Any) -> None: ...
+    def unregister_tensor(self, registration: Any) -> None:
+        """Raises while a receiver may still read the memory, such as after a write that failed with unknown
+        completion."""
 
     def write_shard(self, remote_shard: RemoteShard, tensors_by_name: dict[str, torch.Tensor]) -> None:
         """Writes each tensor into its weight on the shard; returns once the write completes, raises if it fails."""
@@ -52,8 +54,8 @@ class P2PTransport:
 
     The p2p protocol keeps one for the whole trainer process: it registers its transfer buffers once, calls `connect`
     with each new set of rollout engines, then `write` for each rollout engine rank. Each rollout engine has its own
-    write thread, so a stuck engine holds up only its own writes. A failed native write may still read its source, so
-    no registered memory is released after one.
+    write thread, so a stuck engine holds up only its own writes. The native transport decides when registered memory
+    may be released, since only it knows whether a failed write can still read its source.
     """
 
     def __init__(self, native_transport: NativeTransport) -> None:
@@ -61,7 +63,6 @@ class P2PTransport:
         self._executors_by_rollout_engine_ind: dict[int, ThreadPoolExecutor] = {}
         # the registered tensor stays referenced with its registration, so its allocation outlives it
         self._registrations_by_address: dict[int, tuple[torch.Tensor, Any]] = {}
-        self._has_uncertain_writes = False
 
     @property
     def transfer_buffer_device(self) -> torch.device:
@@ -96,11 +97,6 @@ class P2PTransport:
         self._registrations_by_address[tensor.data_ptr()] = (tensor, self._native_transport.register_tensor(tensor))
 
     def unregister_memory(self, tensor: torch.Tensor) -> None:
-        if self._has_uncertain_writes:
-            raise RuntimeError(
-                f"Cannot release registered memory after a {self._native_transport.name} write with unknown native "
-                "completion"
-            )
         _, registration = self._registrations_by_address[tensor.data_ptr()]
         self._native_transport.unregister_tensor(registration)
         del self._registrations_by_address[tensor.data_ptr()]
@@ -139,7 +135,6 @@ class P2PTransport:
         try:
             self._native_transport.write_shard(remote_shard, tensors_by_name)
         except Exception as error:
-            self._has_uncertain_writes = True
             if is_event_logger_initialized() and context.debug_weight_update_id is not None:
                 try:
                     get_event_logger().log(

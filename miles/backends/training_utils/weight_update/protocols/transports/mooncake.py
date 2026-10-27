@@ -16,6 +16,8 @@ class MooncakeTransport:
 
     def __init__(self) -> None:
         self._transfer_engine = _create_transfer_engine()
+        # a failed write does not prove Mooncake stopped reading its source
+        self._has_failed_writes = False
 
     def connect_peer(self, transfer_engine_info: dict) -> str:
         return transfer_engine_info["session_id"]
@@ -33,19 +35,30 @@ class MooncakeTransport:
         return tensor.data_ptr()
 
     def unregister_tensor(self, address: int) -> None:
+        if self._has_failed_writes:
+            raise RuntimeError(
+                f"Cannot release registered memory after a {self.name} write with unknown native completion"
+            )
         ret = self._transfer_engine.unregister_memory(address)
         if ret != 0:
             raise RuntimeError(f"Mooncake could not unregister the memory at {address:#x}: error {ret}")
 
     def write_shard(self, remote_shard: RemoteShard, tensors_by_name: dict[str, torch.Tensor]) -> None:
         names = list(tensors_by_name)
-        ret = self._transfer_engine.batch_transfer_sync_write(
-            remote_shard.transport_peer,
-            [tensors_by_name[name].data_ptr() for name in names],
-            [remote_shard.weight_locations_by_name[name].address for name in names],
-            [tensors_by_name[name].nbytes for name in names],
-        )
-        if ret < 0:
+        succeeded = False
+        try:
+            ret = self._transfer_engine.batch_transfer_sync_write(
+                remote_shard.transport_peer,
+                [tensors_by_name[name].data_ptr() for name in names],
+                [remote_shard.weight_locations_by_name[name].address for name in names],
+                [tensors_by_name[name].nbytes for name in names],
+            )
+            succeeded = ret >= 0
+        finally:
+            # write threads share this flag: only ever set it, so one thread's success never clears another's failure
+            if not succeeded:
+                self._has_failed_writes = True
+        if not succeeded:
             raise RuntimeError(f"Mooncake batch_transfer_sync_write returned {ret}")
 
 
