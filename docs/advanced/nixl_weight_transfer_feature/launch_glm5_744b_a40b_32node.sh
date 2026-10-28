@@ -105,7 +105,9 @@ MILES_FORK=git@github.com:amitw-nv/miles.git
 MILES_BRANCH=amitw/miles-nixl-upstream-exp
 
 SGLANG_FORK=git@github.com:amitw-nv/sglang.git
-SGLANG_BRANCH=amitw/sgl-miles-nixl-upstream-pr
+SGLANG_BRANCH=amitw/sgl-miles-nixl-refactoringcheck
+# Pinned to the SGLang commit of the last good 235B run (job 19892623); the branch tip moves.
+SGLANG_SHA=35abc4dc734591805e8fdd469516df9737f6555e
 
 LUSTRE=/lustre/fsw/portfolios/network/users/amitw/miles
 SQSH=$LUSTRE/radixark+miles+latest+100926.sqsh
@@ -158,7 +160,6 @@ stage_repo "$MILES_SRC"  "$MILES_FORK"  "$MILES_BRANCH"
 stage_repo "$SGLANG_SRC" "$SGLANG_FORK" "$SGLANG_BRANCH"
 
 MILES_SHA=$(git -C "$MILES_SRC" rev-parse "$MILES_BRANCH")
-SGLANG_SHA=$(git -C "$SGLANG_SRC" rev-parse "$SGLANG_BRANCH")
 
 echo "Miles  : $MILES_BRANCH @ ${MILES_SHA:0:9}"
 echo "SGLang : $SGLANG_BRANCH @ ${SGLANG_SHA:0:9}"
