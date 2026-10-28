@@ -25,9 +25,10 @@ Which loop a metric uses:
 - `trainer_prep_time` cpu — host work starting on the main thread right
   after `load_weights`, until just before the RDMA write. Then sum across
   inner **and** outer so the logged number is the full transfer.
-- `max_num_wire_bytes_per_trainer`, `wire_time` — inner (replica / session).
-  Then sum across inner **and** outer so the logged number is the full
-  transfer.
+- `max_num_wire_bytes_per_trainer` — inner (replica / session). Then sum
+  across inner **and** outer so the logged number is the full transfer.
+- `wire_time` — every session's `(start, end)`; the logged number is their
+  union over the full transfer.
 - `trainer_active_time` — the whole `update_weights` send path, not a sum of
   either loop.
 
@@ -58,13 +59,16 @@ matching suffix.
 **What it measures:** Time the trainer spent in RDMA: from the CPU starting
 the NIXL write until it returns.
 
-**How we measure it:** Inner: timer around `_do_nixl_write` (start right before,
-stop when it returns).
+**How we measure it:** Inner: record the `time.monotonic()` `(start, end)` of
+every `_do_nixl_write` (start right before, end when it returns). The logged
+number is the **union** of all those intervals on this GPU: the wall clock with
+at least one write in flight.
 
 One replica can RDMA the same buffer to several targets in parallel (one
-session per engine). Count that group **once**: take the longest session
-time, not the sum. Then sum across CPU replicas on this GPU (they run one
-after the other on the shared buffer) and across every outer `send_bucket`.
+session per engine). Overlapping sessions count once, so two writes that
+overlap only partly give their combined span, not the longest one and not the
+sum. CPU replicas run one after the other on the shared buffer and outer
+`send_bucket`s are separate, so their idle gaps count zero.
 
 **What you see in the log:** The GPU with the largest work.
 
@@ -149,8 +153,8 @@ waiting for a pool thread, and pointer setup.
 **How we measure it:** One `time.monotonic()` start on the main thread
 immediately after `load_weights` returns, before `begin_wire_group`. Each
 session of that replica stops right before `_do_nixl_write`. Sessions share
-that start and can run in parallel: count the group **once** (longest stop),
-like `wire_time`. Then sum every replica and every outer `send_bucket`.
+that start and can run in parallel: count the group **once** (longest stop).
+Then sum every replica and every outer `send_bucket`.
 `load_weights` is gpu-prep, not this number.
 
 **What you see in the log:** Three lines: GPU with max gpu-prep, GPU with max
@@ -204,7 +208,7 @@ Aggregation (full transfer = one log section):
 | Metric | Per event | Fold parallel sessions | Fold sequential replicas | Fold outer `send_bucket` | Log |
 |---|---|---|---|---|---|
 | `max_num_wire_bytes_per_trainer` | `sum(source_lens)` in `_do_p2p_write_one_session` | **sum** (every session) | sum | sum | GPU with max bytes |
-| `wire_time` | timer around `_do_nixl_write` | **max** (count once) | sum | sum | GPU with max work |
+| `wire_time` | `(start, end)` around `_do_nixl_write` | **union** of intervals (all levels) | union | union | GPU with max work |
 | `trainer_prep_time` gpu | `next(iterator)` until after staging, plus each `load_weights` | n/a (outer, main thread) | **sum** loads | sum | GPU with max gpu_prep |
 | `trainer_prep_time` gpu gather | `_materialize_*` / bridge `export_hf_weights` `next()` | n/a | n/a | sum | that GPU's gather |
 | `trainer_prep_time` gpu gather_load | `_load_or_allocate_params` | n/a | n/a | sum | that GPU's load |
@@ -250,9 +254,8 @@ Hook sites:
   `load_weights` per replica as gpu-prep `cpu_load` (added into `gpu_prep`);
   start the cpu-prep clock immediately after that `load_weights`.
 - `p2p.py` `_do_p2p_write_one_session`: add bytes; stop cpu-prep right before
-  `_do_nixl_write`; group sessions of one replica so wire_time / cpu-setup
-  use max, not sum.
-- `p2p.py` `_do_nixl_write`: start/stop for wire_time.
+  `_do_nixl_write`; group sessions of one replica so cpu-setup uses max, not
+  sum. Record the `_do_nixl_write` `(start, end)` for the wire_time union.
 - `p2p.py` `after_base_weights`: `wait_transfers()`, stop active time,
   `gather_object` on gloo, rank 0 appends to `p2p_nixl_perf.log`.
 
@@ -315,7 +318,7 @@ new cpu-prep bar after the previous replica's RDMA.
 
 `wire_time` is one bar per replica. It starts immediately before
 `_do_nixl_write` and stops when that call returns (including the DONE poll).
-Parallel sessions of one replica keep the longest write, not the sum.
+Parallel sessions of one replica count as the union of their intervals, not the sum.
 
 ### One full `update_weights`
 
@@ -337,6 +340,6 @@ be in flight until that wait.
 
 Parallel sessions of one replica share the cpu-prep start taken right after
 `load_weights` and each stop before their own `_do_nixl_write`. Each session
-still has its own `wire_time` clock. The replica keeps the longest of each,
-not the sum.
+still records its own `wire_time` `(start, end)`. cpu-prep keeps the longest
+stop of the replica, not the sum. `wire_time` takes the union of the intervals.
 

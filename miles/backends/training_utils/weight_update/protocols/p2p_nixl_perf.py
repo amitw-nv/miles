@@ -17,7 +17,7 @@ _GB = 1000**3
 class TimeMonitor:
     """`time.monotonic()` start/stop around a region.
 
-    `wire_time` uses this around `_do_nixl_write`. `trainer_prep_time` gpu uses
+    `trainer_prep_time` gpu uses
     one instance on the collector from `next(iterator)` until after staging;
     each `load_weights` is added into that total separately. `trainer_prep_time`
     cpu starts on the main thread immediately after `load_weights` and stops
@@ -72,6 +72,22 @@ GPU_PREP_PARTS = (
     GPU_PREP_CPU_LOAD,
 )
 
+def _union_seconds(intervals: Iterable[tuple[float, float]]) -> float:
+    """Total length covered by at least one `(start, end)` interval."""
+    total = 0.0
+    merged_start = merged_end = None
+    for start, end in sorted(intervals):
+        if merged_end is None or start > merged_end:
+            if merged_end is not None:
+                total += merged_end - merged_start
+            merged_start, merged_end = start, end
+        else:
+            merged_end = max(merged_end, end)
+    if merged_end is not None:
+        total += merged_end - merged_start
+    return total
+
+
 _T = TypeVar("_T")
 _add_part: ContextVar[Callable[[str, float], None] | None] = ContextVar("gpu_prep_add_part", default=None)
 
@@ -115,8 +131,9 @@ class P2PNixlPerfCollector:
 
     Identity fields (`gpu`, `pp_rank`, `gathered_dp_rank`) ride on every payload so
     rank 0 can label the bottleneck GPU in the log. Wire-byte parts feed
-    `max_num_wire_bytes_per_trainer`. Per-replica session times feed `wire_time`
-    (max within a replica, then sum across replicas and `send_bucket` steps).
+    `max_num_wire_bytes_per_trainer`. The `(start, end)` span of every session
+    write feeds `wire_time` (their union, so parallel sessions are not summed or
+    maxed and gaps between replicas / `send_bucket` steps count zero).
     `gpu_prep` sums outer `next(iterator)` intervals plus every `load_weights`.
     `gpu_gather` / `gpu_convert` / `gpu_stage` sum the functions inside that
     outer clock. Gather also has load / PP / TP / EP chunks on the raw path.
@@ -134,7 +151,7 @@ class P2PNixlPerfCollector:
     _wire_bytes_parts: list[int] = field(default_factory=list)
     _next_wire_group: int = 0
     _current_wire_group: int | None = None
-    _wire_groups: dict[int, list[float]] = field(default_factory=dict)
+    _wire_intervals: list[tuple[float, float]] = field(default_factory=list)
     _cpu_setup_groups: dict[int, list[float]] = field(default_factory=dict)
     _gpu_prep: float = 0.0
     _gpu_parts: dict[str, float] = field(default_factory=dict)
@@ -153,7 +170,7 @@ class P2PNixlPerfCollector:
         self._wire_bytes_parts = []
         self._next_wire_group = 0
         self._current_wire_group = None
-        self._wire_groups = {}
+        self._wire_intervals = []
         self._cpu_setup_groups = {}
         self._gpu_prep = 0.0
         self._gpu_parts = {}
@@ -172,30 +189,27 @@ class P2PNixlPerfCollector:
         self._wire_bytes_parts.append(num_bytes)
 
     def begin_wire_group(self) -> int:
-        """Open one replica's parallel-session group for `wire_time` and cpu setup.
+        """Open one replica's parallel-session group for cpu setup.
 
         Sessions in this group are one replica's RDMA targets (they share a buffer
-        and run in the thread pool together). `wire_time` and cpu pointer-setup
-        each count the group once (max session), then sum groups across replicas
-        and outer `send_bucket`s.
+        and run in the thread pool together). cpu pointer-setup counts the group
+        once (max session), then sums groups across replicas and outer
+        `send_bucket`s. `wire_time` does not use groups: it is a union of the
+        write intervals.
         """
         group_id = self._next_wire_group
         self._next_wire_group += 1
-        self._wire_groups[group_id] = []
         self._cpu_setup_groups[group_id] = []
         self._current_wire_group = group_id
         return group_id
 
-    def add_session_wire_time(self, group_id: int | None, duration: float) -> None:
-        """Record one `_do_nixl_write` duration into its replica group.
+    def add_session_wire_interval(self, t_start: float, t_end: float) -> None:
+        """Record the `time.monotonic()` span of one `_do_nixl_write`.
 
-        `wire_time`: per-event timer around the NIXL write. Parallel sessions of
-        one replica land in the same group so we can take max, not sum.
+        `wire_time`: the union of these spans, so overlapping parallel sessions
+        count once and idle gaps between replicas / buckets count zero.
         """
-        if group_id is None:
-            group_id = -1
-            self._wire_groups.setdefault(group_id, [])
-        self._wire_groups[group_id].append(duration)
+        self._wire_intervals.append((t_start, t_end))
 
     def add_cpu_load(self, duration: float) -> None:
         """Record one `load_weights` duration inside `gpu_prep`.
@@ -271,10 +285,10 @@ class P2PNixlPerfCollector:
     def wire_time(self) -> float:
         """RDMA work on this GPU in this transfer.
 
-        `wire_time`: max session time per replica group, then sum groups (replicas
-        and outer `send_bucket`s). Rank 0 logs the GPU with the largest work.
+        `wire_time`: wall clock with at least one RDMA write in flight (union of
+        every session's `(start, end)`). Rank 0 logs the GPU with the largest work.
         """
-        return sum(max(times) for times in self._wire_groups.values() if times)
+        return _union_seconds(self._wire_intervals)
 
     def gpu_prep(self) -> float:
         """All-gather + HF convert + quant + staging, plus every `load_weights`.
@@ -446,7 +460,6 @@ def add_session_cpu_setup(
 def timed_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> float:
     """Run `fn` and return elapsed seconds. Re-raises if `fn` raises.
 
-    `wire_time`: clock around `_do_nixl_write` only (not pointer setup).
     `trainer_prep_time` gpu `cpu_load`: clock around `load_weights`.
     """
     monitor = TimeMonitor()
@@ -459,13 +472,11 @@ def timed_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> float:
         raise
 
 
-def add_session_wire_time(
-    collector: P2PNixlPerfCollector | None, duration: float, *, group_id: int | None = None
-) -> None:
-    """No-op on mooncake. On NIXL, record this write into a replica group for `wire_time`."""
+def add_session_wire_interval(collector: P2PNixlPerfCollector | None, t_start: float, t_end: float) -> None:
+    """No-op on mooncake. On NIXL, record this write's span for the `wire_time` union."""
     if collector is None:
         return
-    collector.add_session_wire_time(group_id, duration)
+    collector.add_session_wire_interval(t_start, t_end)
 
 
 def perf_log_path() -> Path:

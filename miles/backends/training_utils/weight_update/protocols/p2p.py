@@ -28,7 +28,7 @@ from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import 
     GPU_PREP_STAGE,
     add_cpu_load,
     add_session_cpu_setup,
-    add_session_wire_time,
+    add_session_wire_interval,
     add_wire_bytes,
     begin_wire_group,
     current_wire_group,
@@ -478,10 +478,9 @@ class UpdateWeightP2P(WeightTransferProtocol):
 
         if remote_session.backend == "nixl":
             add_session_cpu_setup(self._nixl_perf, time.monotonic() - cpu_prep_start, group_id=wire_group)
-            elapsed = timed_call(
-                self._do_nixl_write, remote_session, source_ptrs, source_lens, target_ptrs, target_device_ids
-            )
-            add_session_wire_time(self._nixl_perf, elapsed, group_id=wire_group)
+            t_start = time.monotonic()
+            self._do_nixl_write(remote_session, source_ptrs, source_lens, target_ptrs, target_device_ids)
+            add_session_wire_interval(self._nixl_perf, t_start, time.monotonic())
             return
 
         ret = self._transfer_engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)

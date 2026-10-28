@@ -19,7 +19,7 @@ from miles.backends.training_utils.weight_update.protocols.p2p_nixl_perf import 
     add_cpu_load,
     add_gpu_prep_part,
     add_session_cpu_setup,
-    add_session_wire_time,
+    add_session_wire_interval,
     add_wire_bytes,
     begin_wire_group,
     format_gb,
@@ -363,16 +363,18 @@ class TestP2PNixlPerfHelpers:
         assert collector.wire_bytes() == 5
         assert collector.weight_version == 8
 
-    def test_parallel_sessions_count_once_as_max_then_replicas_sum(self):
-        """wire_time: max within a replica (parallel sessions), then sum sequential replicas / buckets."""
+    def test_wire_time_is_the_union_of_session_intervals(self):
+        """wire_time: overlapping parallel sessions merge, disjoint ones add, gaps count zero."""
         collector = new_collector(gpu=5, pp_rank=0, gathered_dp_rank=5)
         reset_collector(collector, weight_version=1)
-        replica_a = begin_wire_group(collector)
-        collector.add_session_wire_time(replica_a, 1.0)
-        collector.add_session_wire_time(replica_a, 3.0)
-        replica_b = begin_wire_group(collector)
-        collector.add_session_wire_time(replica_b, 2.0)
-        assert collector.wire_time() == 5.0
+        # replica A: two parallel sessions, [0, 3] and [2, 4] overlap -> 4s (not max 3s, not sum 5s)
+        collector.add_session_wire_interval(0.0, 3.0)
+        collector.add_session_wire_interval(2.0, 4.0)
+        # replica B after a gap: [10, 12] -> 2s
+        collector.add_session_wire_interval(10.0, 12.0)
+        # a session contained in another adds nothing
+        collector.add_session_wire_interval(10.5, 11.0)
+        assert collector.wire_time() == 6.0
 
         reset_collector(collector, weight_version=2)
         assert collector.wire_time() == 0.0
@@ -435,7 +437,7 @@ class TestP2PNixlPerfHelpers:
         assert wrap_gpu_prep_iter(None, inner) is inner
 
     def test_timed_call_measures_until_the_function_returns(self):
-        """wire_time starts right before `_do_nixl_write` and stops when it returns."""
+        """The load_weights timer stops when the function returns."""
 
         def _sleep() -> None:
             time.sleep(0.02)
@@ -455,7 +457,7 @@ class TestP2PNixlPerfHelpers:
         """Mooncake P2P never constructs a collector, so the hooks must not throw."""
         reset_collector(None, weight_version=1)
         add_wire_bytes(None, 100)
-        add_session_wire_time(None, 0.1)
+        add_session_wire_interval(None, 0.0, 0.1)
         add_cpu_load(None, 0.1)
         add_session_cpu_setup(None, 0.1)
         stop_gpu_prep(None)
